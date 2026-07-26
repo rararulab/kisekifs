@@ -32,7 +32,8 @@ pub fn var(key: &str) -> Result<Option<String>, Whatever> {
     match dotenvy::var(key) {
         Ok(content) => Ok(Some(content)),
         Err(dotenvy::Error::EnvVar(std::env::VarError::NotPresent)) => Ok(None),
-        Err(error) => whatever!(Err(error), "Failed to read {key} environment variable"),
+        Err(error) => Err(error)
+            .with_whatever_context(|_| format!("Failed to read {key} environment variable")),
     }
 }
 
@@ -73,11 +74,9 @@ pub fn required_var(key: &str) -> Result<String, Whatever> { required(var(key), 
 
 fn required<T>(res: Result<Option<T>, Whatever>, key: &str) -> Result<T, Whatever> {
     match res {
-        Ok(opt) => {
-            if opt.is_none() {
-                whatever!("Failed to find required {key} environment variable")
-            }
-            Ok(opt.unwrap())
+        Ok(Some(value)) => Ok(value),
+        Ok(None) => {
+            whatever!("Failed to find required {key} environment variable");
         }
         Err(error) => Err(error),
     }
