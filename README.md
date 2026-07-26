@@ -2,10 +2,15 @@
 
 Go check the [doc](https://crrow.github.io/kisekifs/).
 
-Kiseki is my learning rust project, a simple 'distributed' fuse file system that is port
-of [JuiceFS](https://github.com/juicedata/juicefs).
+Kiseki is a distributed FUSE filesystem, originally a port of
+[JuiceFS](https://github.com/juicedata/juicefs), now being built toward a
+**production-usable, performance-oriented** product. It separates data
+(object storage such as S3) from metadata (RocksDB today, a shared/network
+backend planned for multi-node).
 
-**It's just a rust learning project**
+> **Status:** the project has moved beyond its original "learning project"
+> phase and is being hardened for production. Expect breaking changes while core
+> gaps (read-path caching, distributed metadata, FUSE layer) are addressed.
 
 If you don't know juicefs very much, the following is the introduction of juicefs:
 
@@ -54,7 +59,7 @@ supported and intentionally unsupported behavior is listed in the
 
 ## Disclaimer
 
-Kiseki is an independent learning project
+Kiseki is an independent project
 and is not endorsed by or affiliated with the Juice company.
 
 # License

@@ -1,0 +1,26 @@
+name: Chore / Maintenance
+description: CI, dependencies, tooling, or other maintenance tasks
+labels: ["chore"]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: What maintenance work is needed?
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      description: What area does this affect?
+      options:
+        - ci (GitHub Actions, workflows)
+        - dependencies (crate updates)
+        - tooling (dev tooling, scripts, justfile)
+        - release (versioning, changelog, publishing)
+        - documentation
+        - other
+    validations:
+      required: true

@@ -1,0 +1,46 @@
+# Pre-commit hooks for KisekiFS, run via prek (https://github.com/j178/prek).
+# Setup once:  prek install && prek install --hook-type commit-msg
+# Manual run:  prek run --all-files
+#
+# The FINAL commit of a change must pass all checks. Do NOT use --no-verify.
+repos:
+  - repo: local
+    hooks:
+      - id: cargo-check
+        name: cargo check
+        entry: cargo check --all --all-features
+        language: system
+        pass_filenames: false
+        types_or: [rust, toml]
+        files: \.(rs|toml)$|Cargo\.lock$|rust-toolchain\.toml$
+
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: cargo +nightly fmt --all -- --check
+        language: system
+        pass_filenames: false
+        types_or: [rust, toml]
+        files: \.(rs|toml)$|Cargo\.lock$|rust-toolchain\.toml$
+
+      - id: cargo-clippy
+        name: cargo clippy
+        entry: cargo clippy --workspace --all-targets --all-features --no-deps -- -D warnings
+        language: system
+        pass_filenames: false
+        types_or: [rust, toml]
+        files: \.(rs|toml)$|Cargo\.lock$|rust-toolchain\.toml$
+
+      - id: cargo-doc
+        name: cargo doc
+        entry: env RUSTDOCFLAGS="-D warnings" cargo +nightly doc --workspace --no-deps --document-private-items
+        language: system
+        pass_filenames: false
+        types_or: [rust, toml]
+        files: \.(rs|toml)$|Cargo\.lock$|rust-toolchain\.toml$
+
+      - id: conventional-commit
+        name: conventional commit message
+        entry: scripts/check-conventional-commit.sh
+        language: script
+        stages: [commit-msg]
+        always_run: true

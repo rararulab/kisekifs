@@ -1,14 +1,40 @@
-# Description
+## What & why
 
-<!--- Describe your changes in detail -->
+<!-- Explain your change as a story a reviewer can follow WITHOUT reading the diff first:
+  - What problem or goal prompted this? (the issue's Intent — don't just restate the title)
+  - What approach did you take, and *why this one*? Name the key design decision.
+  - What did you consider and reject, or what non-obvious constraint/tradeoff shaped it?
+  The diff shows WHAT changed. This section must explain WHY it looks like this. -->
 
-<!--- If it fixes an open issue, please link to the issue here. -->
+## Type of change
 
-<!--- Please link any related issues and PRs as well. -->
+<!-- Add the matching type label to this PR -->
 
-## How are the changes test-covered
+| Type | Label |
+|------|-------|
+| Bug fix | `bug` |
+| New feature | `enhancement` |
+| Refactor | `refactor` |
+| CI / Infrastructure | `ci` |
+| Maintenance | `chore` |
+| Documentation | `documentation` |
 
-- [ ] N/A
-- [ ] Automated tests (unit and/or integration tests)
-- [ ] Manual tests
-- [ ] Details are described below
+## Component
+
+<!-- Which crate(s) does this touch? -->
+<!-- `fuse` · `vfs` · `meta` · `storage` · `types` · `common` · `utils` · `binary` -->
+
+## Closes
+
+<!-- REQUIRED: link the issue this PR resolves; merge auto-closes it. -->
+<!-- If no issue exists, create one first: gh issue create -->
+
+Closes #
+
+## How to verify
+
+<!-- Commands you ran or steps a reviewer can repeat — evidence, not a command dump. -->
+- [ ] `just check` / `just lint` pass
+- [ ] `cargo test -p <crate>` (or `just test`) as relevant
+- [ ] Mounted acceptance (`just test-mounted`) when the change touches the mounted path
+- [ ] Tested locally (say how)

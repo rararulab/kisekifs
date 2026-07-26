@@ -2,9 +2,20 @@
 
 ## What This Project Is
 
-KisekiFS is a Rust learning project—a distributed FUSE filesystem ported from
-[JuiceFS](https://github.com/juicedata/juicefs). It separates data storage
+KisekiFS is a distributed FUSE filesystem, originally ported from
+[JuiceFS](https://github.com/juicedata/juicefs), now being built toward a
+**production-usable, performance-oriented** product. It separates data storage
 (object storage like S3) from metadata storage (RocksDB).
+
+## Project Direction
+
+KisekiFS is being hardened from a learning exercise into a production distributed
+filesystem; **production-readiness and performance are now first-class goals** (a
+change from older docs/commits that still call it a "learning project"). The
+roadmap (architecture-review issues #68–#76 on `rararulab/kisekifs`) and the key
+architecture decisions — notably the **FUSE layer migrating to `fuse-backend-rs`**
+— live in [docs/src/direction.md](docs/src/direction.md). Read it before touching
+the FUSE layer, metadata backend, or data path.
 
 **Workspace Structure:**
 
@@ -25,7 +36,8 @@ docs/            # mdbook sources (`just book` to serve)
 
 **Key Technologies:**
 
-- **FUSE**: fuser (requires libfuse3 installed)
+- **FUSE**: `fuser` today, migrating to `fuse-backend-rs` (see Project Direction
+  & Goals); requires libfuse3 installed
 - **Async Runtime**: tokio
 - **Object Storage**: opendal and object_store (see storage note below)
 - **Metadata**: RocksDB
@@ -42,9 +54,19 @@ improvements:
 
 ## Development Workflow
 
-- **Direct commits to `main` are allowed.** Development happens on short-lived
-  branches in git worktrees under `.worktrees/<task>`, merged back to `main`,
-  then the worktree and branch are removed after merge. No PRs.
+**`main` is protected. Every change — however small — goes through a worktree
+branch and a PR.** Never commit directly to `main` and never edit files on the
+main checkout; a `guard-main-branch` hook enforces this. The flow is
+spec/issue → worktree → local commits → verify → review → push → PR → merge,
+adopted from the reference repo `rararulab/rara` for **parallel multi-agent
+development**. The full normative process is in
+[docs/guides/workflow.md](docs/guides/workflow.md); commit format is in
+[docs/guides/commit-style.md](docs/guides/commit-style.md) (Conventional Commits,
+enforced by a `commit-msg` hook).
+
+- **Every change is issue-first + PR-based.** `git worktree add
+  .worktrees/issue-N-<slug> -b issue-N-<slug>`, commit with `Closes #N`, open a
+  PR, merge with `--squash --delete-branch` once CI is green and review approves.
 - **Storage abstraction is frozen.** Both `opendal` (components/storage, vfs)
   and `object_store` (components/utils) are present. The intended direction is
   opendal, but do not migrate anything until explicitly requested.

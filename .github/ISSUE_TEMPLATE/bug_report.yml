@@ -1,0 +1,53 @@
+name: Bug Report
+description: Report a bug or unexpected behavior
+labels: ["bug"]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: What happened? What did you expect?
+    validations:
+      required: true
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      description: Which crate is affected?
+      options:
+        - fuse (FUSE layer)
+        - vfs (virtual filesystem logic)
+        - meta (metadata / RocksDB backend)
+        - storage (write buffer, caches, page pool)
+        - types (shared types)
+        - common / utils (helpers, object storage)
+        - binary (CLI / mount)
+        - ci (CI/CD, build, release)
+        - other
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Minimal steps to reproduce the issue
+      placeholder: |
+        1. Mount with `kiseki mount ...`
+        2. Run `...`
+        3. Observe error ...
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / Error output
+      description: Relevant log output or error messages
+      render: shell
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Commit SHA or `kiseki --version`
+      placeholder: "kiseki 0.1.0"
