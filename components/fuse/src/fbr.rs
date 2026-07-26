@@ -12,38 +12,32 @@
 
 //! fuse-backend-rs implementation of the KisekiFS FUSE layer.
 //!
-//! Async-native replacement for the `fuser`-based layer in `lib.rs` (issue
-//! #71); the two coexist during migration so behaviour can be compared.
+//! Replacement for the `fuser`-based layer in `lib.rs` (issue #71); the two
+//! coexist during migration so behaviour can be compared side by side.
 //!
 //! ## Runtime model
 //!
-//! fuse-backend-rs' async server drives requests on a `tokio-uring` (io_uring)
-//! runtime, one per worker thread. The VFS keeps its own multi-threaded Tokio
-//! runtime. Fuse methods dispatch VFS futures onto the VFS runtime via a
-//! [`Handle`]:
+//! We use fuse-backend-rs' production fusedev path: a [`FuseSession`] plus a
+//! pool of worker threads each looping on `FuseChannel::get_request` +
+//! `Server::handle_message`. That path dispatches to the *synchronous*
+//! `FileSystem` trait. The KisekiFS VFS is async and keeps its own
+//! multi-threaded Tokio runtime, so each `FileSystem` method bridges via
+//! [`Handle::block_on`]. This does not hit the "block_on inside an async
+//! runtime" panic: the fusedev worker threads are plain OS threads with no
+//! runtime entered, and with `N` workers there are `N` concurrent in-flight
+//! requests — the same model nydus / virtiofsd ship.
 //!
-//! * async (hot-path) methods `spawn` on the VFS runtime and `.await` the join
-//!   handle — no `block_on` on the io_uring worker;
-//! * the remaining ops are dispatched by fuse-backend-rs to the *synchronous*
-//!   `FileSystem` methods (there is no `async_readdir`/`async_mkdir`); those
-//!   run inline on the io_uring thread, so they offload to the VFS runtime and
-//!   block only the current worker via [`futures::executor::block_on`].
+//! (fuse-backend-rs 0.14's async fusedev task `FuseDevTask` is gated behind a
+//! non-existent `async_io` feature and is dead code, so the async server has no
+//! usable driver; the sync worker-pool path above is the production one.)
 
-use std::{
-    ffi::CStr,
-    future::Future,
-    io,
-    path::Path,
-    sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::{ffi::CStr, io, path::Path, sync::Arc, time::Duration};
 
-use async_trait::async_trait;
 use fuse_backend_rs::{
     abi::fuse_abi::{CreateIn, stat64, statvfs64},
     api::filesystem::{
-        AsyncFileSystem, AsyncZeroCopyReader, AsyncZeroCopyWriter, Context, DirEntry, Entry,
-        FileSystem, FsOptions, OpenOptions, SetattrValid,
+        Context, DirEntry, Entry, FileSystem, FsOptions, OpenOptions, SetattrValid, ZeroCopyReader,
+        ZeroCopyWriter,
     },
 };
 use fuser::TimeOrNow;
@@ -70,9 +64,7 @@ const fn zeroed_pod<T>() -> T {
     unsafe { std::mem::zeroed() }
 }
 
-fn to_io<E: ToErrno>(errno: E) -> io::Error { io::Error::from_raw_os_error(errno.to_errno()) }
-
-fn join_io(_e: tokio::task::JoinError) -> io::Error { io::Error::from_raw_os_error(libc::EIO) }
+fn to_io<E: ToErrno>(e: E) -> io::Error { io::Error::from_raw_os_error(e.to_errno()) }
 
 fn errno_io(errno: i32) -> io::Error { io::Error::from_raw_os_error(errno) }
 
@@ -101,15 +93,15 @@ const fn dir_entry_type(kind: FileType) -> u32 {
     dt as u32
 }
 
-fn system_time_parts(t: SystemTime) -> (i64, i64) {
-    match t.duration_since(UNIX_EPOCH) {
+fn system_time_parts(t: std::time::SystemTime) -> (i64, i64) {
+    match t.duration_since(std::time::UNIX_EPOCH) {
         Ok(d) => (d.as_secs() as i64, d.subsec_nanos() as i64),
         Err(_) => (0, 0),
     }
 }
 
-fn system_time_from(secs: i64, nsecs: i64) -> SystemTime {
-    UNIX_EPOCH + Duration::new(secs.max(0) as u64, nsecs.clamp(0, 999_999_999) as u32)
+fn system_time_from(secs: i64, nsecs: i64) -> std::time::SystemTime {
+    std::time::UNIX_EPOCH + Duration::new(secs.max(0) as u64, nsecs.clamp(0, 999_999_999) as u32)
 }
 
 /// Convert a KisekiFS [`InodeAttr`] into a `libc::stat64`.
@@ -155,8 +147,12 @@ pub struct KisekiFsBackend {
 impl KisekiFsBackend {
     pub const fn new(vfs: Arc<KisekiVFS>, vfs_rt: Handle) -> Self { Self { vfs, vfs_rt } }
 
-    fn ctx(&self, ctx: &Context) -> FuseContext {
-        FuseContext::from_uid_gid_pid(ctx.uid, ctx.gid, ctx.pid as u32)
+    fn ctx(&self, ctx: &Context) -> Arc<FuseContext> {
+        Arc::new(FuseContext::from_uid_gid_pid(
+            ctx.uid,
+            ctx.gid,
+            ctx.pid as u32,
+        ))
     }
 
     fn build_entry(&self, e: &FullEntry) -> Entry {
@@ -172,38 +168,8 @@ impl KisekiFsBackend {
         }
     }
 
-    /// Await a VFS future from an async (io_uring) context by offloading it to
-    /// the VFS runtime. The inner error is reduced to an errno inside the task
-    /// so the VFS error type does not need to cross the runtime boundary.
-    async fn run<F, T>(&self, fut: F) -> io::Result<T>
-    where
-        F: Future<Output = std::result::Result<T, i32>> + Send + 'static,
-        T: Send + 'static,
-    {
-        self.vfs_rt
-            .spawn(fut)
-            .await
-            .map_err(join_io)?
-            .map_err(errno_io)
-    }
-
-    /// Block on a VFS future from a synchronous (io_uring worker) context.
-    /// Offloads to the VFS runtime and parks only the current worker.
-    fn block<F, T>(&self, fut: F) -> io::Result<T>
-    where
-        F: Future<Output = std::result::Result<T, i32>> + Send + 'static,
-        T: Send + 'static,
-    {
-        let jh = self.vfs_rt.spawn(fut);
-        futures::executor::block_on(jh)
-            .map_err(join_io)?
-            .map_err(errno_io)
-    }
+    fn cstr(name: &CStr) -> io::Result<&str> { name.to_str().map_err(|_| errno_io(libc::EINVAL)) }
 }
-
-// ---------------------------------------------------------------------------
-// synchronous FileSystem: base + ops the async server dispatches synchronously
-// ---------------------------------------------------------------------------
 
 impl FileSystem for KisekiFsBackend {
     type Handle = u64;
@@ -213,368 +179,31 @@ impl FileSystem for KisekiFsBackend {
 
     fn destroy(&self) {}
 
-    fn readlink(&self, ctx: &Context, inode: Self::Inode) -> io::Result<Vec<u8>> {
-        let ctx = Arc::new(self.ctx(ctx));
-        let vfs = self.vfs.clone();
-        let target = self.block(async move {
-            vfs.readlink(ctx, Ino::from(inode))
-                .await
-                .map_err(|e| e.to_errno())
-        })?;
-        Ok(target.to_vec())
-    }
-
-    fn symlink(
-        &self,
-        ctx: &Context,
-        linkname: &CStr,
-        parent: Self::Inode,
-        name: &CStr,
-    ) -> io::Result<Entry> {
-        let target = linkname
-            .to_str()
-            .map_err(|_| errno_io(libc::EINVAL))?
-            .to_owned();
-        let name = name
-            .to_str()
-            .map_err(|_| errno_io(libc::EINVAL))?
-            .to_owned();
-        let ctx = Arc::new(self.ctx(ctx));
-        let vfs = self.vfs.clone();
-        let fe = self.block(async move {
-            vfs.symlink(ctx, Ino::from(parent), &name, Path::new(&target))
-                .await
-                .map_err(|e| e.to_errno())
-        })?;
-        Ok(self.build_entry(&fe))
-    }
-
-    fn mknod(
-        &self,
-        ctx: &Context,
-        parent: Self::Inode,
-        name: &CStr,
-        mode: u32,
-        rdev: u32,
-        umask: u32,
-    ) -> io::Result<Entry> {
-        let name = name
-            .to_str()
-            .map_err(|_| errno_io(libc::EINVAL))?
-            .to_owned();
-        let ctx = Arc::new(self.ctx(ctx));
-        let vfs = self.vfs.clone();
-        let fe = self.block(async move {
-            vfs.mknod(ctx, Ino::from(parent), name, mode, umask, rdev)
-                .await
-                .map_err(|e| e.to_errno())
-        })?;
-        Ok(self.build_entry(&fe))
-    }
-
-    fn mkdir(
-        &self,
-        ctx: &Context,
-        parent: Self::Inode,
-        name: &CStr,
-        mode: u32,
-        umask: u32,
-    ) -> io::Result<Entry> {
-        let name = name
-            .to_str()
-            .map_err(|_| errno_io(libc::EINVAL))?
-            .to_owned();
-        let ctx = Arc::new(self.ctx(ctx));
-        let vfs = self.vfs.clone();
-        let fe = self.block(async move {
-            vfs.mkdir(ctx, Ino::from(parent), &name, mode, umask)
-                .await
-                .map_err(|e| e.to_errno())
-        })?;
-        Ok(self.build_entry(&fe))
-    }
-
-    fn unlink(&self, ctx: &Context, parent: Self::Inode, name: &CStr) -> io::Result<()> {
-        let name = name
-            .to_str()
-            .map_err(|_| errno_io(libc::EINVAL))?
-            .to_owned();
-        let ctx = Arc::new(self.ctx(ctx));
-        let vfs = self.vfs.clone();
-        self.block(async move {
-            vfs.unlink(ctx, Ino::from(parent), &name)
-                .await
-                .map_err(|e| e.to_errno())
-        })
-    }
-
-    fn rmdir(&self, ctx: &Context, parent: Self::Inode, name: &CStr) -> io::Result<()> {
-        let name = name
-            .to_str()
-            .map_err(|_| errno_io(libc::EINVAL))?
-            .to_owned();
-        let ctx = Arc::new(self.ctx(ctx));
-        let vfs = self.vfs.clone();
-        self.block(async move {
-            vfs.rmdir(ctx, Ino::from(parent), &name)
-                .await
-                .map_err(|e| e.to_errno())
-        })
-    }
-
-    fn rename(
-        &self,
-        ctx: &Context,
-        olddir: Self::Inode,
-        oldname: &CStr,
-        newdir: Self::Inode,
-        newname: &CStr,
-        flags: u32,
-    ) -> io::Result<()> {
-        let oldname = oldname
-            .to_str()
-            .map_err(|_| errno_io(libc::EINVAL))?
-            .to_owned();
-        let newname = newname
-            .to_str()
-            .map_err(|_| errno_io(libc::EINVAL))?
-            .to_owned();
-        let ctx = Arc::new(self.ctx(ctx));
-        let vfs = self.vfs.clone();
-        self.block(async move {
-            vfs.rename(
-                ctx,
-                Ino::from(olddir),
-                &oldname,
-                Ino::from(newdir),
-                &newname,
-                flags,
-            )
-            .await
-            .map_err(|e| e.to_errno())
-        })
-    }
-
-    fn link(
-        &self,
-        ctx: &Context,
-        inode: Self::Inode,
-        newparent: Self::Inode,
-        newname: &CStr,
-    ) -> io::Result<Entry> {
-        let newname = newname
-            .to_str()
-            .map_err(|_| errno_io(libc::EINVAL))?
-            .to_owned();
-        let ctx = Arc::new(self.ctx(ctx));
-        let vfs = self.vfs.clone();
-        let fe = self.block(async move {
-            vfs.link(ctx, Ino::from(inode), Ino::from(newparent), &newname)
-                .await
-                .map_err(|e| e.to_errno())
-        })?;
-        Ok(self.build_entry(&fe))
-    }
-
-    fn opendir(
-        &self,
-        ctx: &Context,
-        inode: Self::Inode,
-        flags: u32,
-    ) -> io::Result<(Option<Self::Handle>, OpenOptions)> {
-        let cctx = self.ctx(ctx);
-        let vfs = self.vfs.clone();
-        let fh = self.block(async move {
-            vfs.open_dir(&cctx, Ino::from(inode), flags as i32)
-                .await
-                .map_err(|e| e.to_errno())
-        })?;
-        Ok((Some(fh), OpenOptions::empty()))
-    }
-
-    fn readdir(
-        &self,
-        ctx: &Context,
-        inode: Self::Inode,
-        handle: Self::Handle,
-        _size: u32,
-        offset: u64,
-        add_entry: &mut dyn FnMut(DirEntry) -> io::Result<usize>,
-    ) -> io::Result<()> {
-        let cctx = self.ctx(ctx);
-        let vfs = self.vfs.clone();
-        let entries = self.block(async move {
-            vfs.read_dir(&cctx, Ino::from(inode), handle, offset as i64, false)
-                .await
-                .map_err(|e| e.to_errno())
-        })?;
-        for (next, e) in (offset + 1..).zip(entries.iter()) {
-            let de = DirEntry {
-                ino:    e.get_inode().0,
-                offset: next,
-                type_:  dir_entry_type(e.get_file_type()),
-                name:   e.get_name().as_bytes(),
-            };
-            if add_entry(de)? == 0 {
-                break;
-            }
-        }
-        Ok(())
-    }
-
-    fn readdirplus(
-        &self,
-        ctx: &Context,
-        inode: Self::Inode,
-        handle: Self::Handle,
-        _size: u32,
-        offset: u64,
-        add_entry: &mut dyn FnMut(DirEntry, Entry) -> io::Result<usize>,
-    ) -> io::Result<()> {
-        let cctx = self.ctx(ctx);
-        let vfs = self.vfs.clone();
-        let entries = self.block(async move {
-            vfs.read_dir(&cctx, Ino::from(inode), handle, offset as i64, true)
-                .await
-                .map_err(|e| e.to_errno())
-        })?;
-        for (next, e) in (offset + 1..).zip(entries.iter()) {
-            let KisekiEntry::Full(fe) = e else { continue };
-            let de = DirEntry {
-                ino:    fe.inode.0,
-                offset: next,
-                type_:  dir_entry_type(fe.attr.kind),
-                name:   fe.name.as_bytes(),
-            };
-            if add_entry(de, self.build_entry(fe))? == 0 {
-                break;
-            }
-        }
-        Ok(())
-    }
-
-    fn releasedir(
-        &self,
-        _ctx: &Context,
-        inode: Self::Inode,
-        _flags: u32,
-        handle: Self::Handle,
-    ) -> io::Result<()> {
-        let vfs = self.vfs.clone();
-        self.block(async move {
-            vfs.release_dir(Ino::from(inode), handle)
-                .await
-                .map_err(|e| e.to_errno())
-        })
-    }
-
-    fn flush(
-        &self,
-        ctx: &Context,
-        inode: Self::Inode,
-        handle: Self::Handle,
-        lock_owner: u64,
-    ) -> io::Result<()> {
-        let ctx = Arc::new(self.ctx(ctx));
-        let vfs = self.vfs.clone();
-        self.block(async move {
-            vfs.flush(ctx, Ino::from(inode), handle, lock_owner)
-                .await
-                .map_err(|e| e.to_errno())
-        })
-    }
-
-    fn release(
-        &self,
-        ctx: &Context,
-        inode: Self::Inode,
-        _flags: u32,
-        handle: Self::Handle,
-        _flush: bool,
-        _flock_release: bool,
-        _lock_owner: Option<u64>,
-    ) -> io::Result<()> {
-        let ctx = Arc::new(self.ctx(ctx));
-        let vfs = self.vfs.clone();
-        // vfs.release returns a JoinHandle for the background finalisation; we do
-        // not need to await it here (matches the fuser layer).
-        self.block(async move {
-            vfs.release(ctx, Ino::from(inode), handle)
-                .await
-                .map(|_| ())
-                .map_err(|e| e.to_errno())
-        })
-    }
-
-    fn statfs(&self, ctx: &Context, inode: Self::Inode) -> io::Result<statvfs64> {
-        let ctx = Arc::new(self.ctx(ctx));
-        let state = self.vfs.stat_fs(ctx, Ino::from(inode)).map_err(to_io)?;
-
-        let total_blocks = (state.total_size / BLOCK_SIZE as u64).max(1);
-        let used_blocks = state.used_size / BLOCK_SIZE as u64;
-        let avail_blocks = total_blocks.saturating_sub(used_blocks);
-
-        let mut st: statvfs64 = zeroed_pod();
-        st.f_bsize = BLOCK_SIZE as u64;
-        st.f_frsize = BLOCK_SIZE as u64;
-        st.f_blocks = total_blocks;
-        st.f_bfree = avail_blocks;
-        st.f_bavail = avail_blocks;
-        st.f_files = u64::MAX;
-        st.f_ffree = u64::MAX - state.file_count;
-        st.f_favail = u64::MAX - state.file_count;
-        st.f_namemax = MAX_NAME_LENGTH as u64;
-        Ok(st)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// asynchronous hot path
-// ---------------------------------------------------------------------------
-
-#[async_trait]
-impl AsyncFileSystem for KisekiFsBackend {
-    async fn async_lookup(
-        &self,
-        ctx: &Context,
-        parent: Self::Inode,
-        name: &CStr,
-    ) -> io::Result<Entry> {
-        let name = name
-            .to_str()
-            .map_err(|_| errno_io(libc::EINVAL))?
-            .to_owned();
-        let cctx = Arc::new(self.ctx(ctx));
-        let vfs = self.vfs.clone();
+    fn lookup(&self, ctx: &Context, parent: Self::Inode, name: &CStr) -> io::Result<Entry> {
+        let name = Self::cstr(name)?;
+        let ctx = self.ctx(ctx);
         let fe = self
-            .run(async move {
-                vfs.lookup(cctx, Ino::from(parent), &name)
-                    .await
-                    .map_err(|e| e.to_errno())
-            })
-            .await?;
+            .vfs_rt
+            .block_on(self.vfs.lookup(ctx, Ino::from(parent), name))
+            .map_err(to_io)?;
         Ok(self.build_entry(&fe))
     }
 
-    async fn async_getattr(
+    fn getattr(
         &self,
         _ctx: &Context,
         inode: Self::Inode,
         _handle: Option<Self::Handle>,
     ) -> io::Result<(stat64, Duration)> {
-        let vfs = self.vfs.clone();
         let attr = self
-            .run(async move {
-                vfs.get_attr(Ino::from(inode))
-                    .await
-                    .map_err(|e| e.to_errno())
-            })
-            .await?;
+            .vfs_rt
+            .block_on(self.vfs.get_attr(Ino::from(inode)))
+            .map_err(to_io)?;
         let ttl = *self.vfs.get_entry_ttl(attr.kind);
         Ok((attr_to_stat64(&attr, inode), ttl))
     }
 
-    async fn async_setattr(
+    fn setattr(
         &self,
         ctx: &Context,
         inode: Self::Inode,
@@ -628,119 +257,227 @@ impl AsyncFileSystem for KisekiFsBackend {
             None
         };
 
-        let bits = flags.bits();
-        let cctx = Arc::new(self.ctx(ctx));
-        let vfs = self.vfs.clone();
+        let ctx = self.ctx(ctx);
         let new = self
-            .run(async move {
-                vfs.set_attr(
-                    cctx,
-                    Ino::from(inode),
-                    bits,
-                    atime,
-                    mtime,
-                    mode,
-                    uid,
-                    gid,
-                    size,
-                    fh,
-                    None,
-                )
-                .await
-                .map_err(|e| e.to_errno())
-            })
-            .await?;
+            .vfs_rt
+            .block_on(self.vfs.set_attr(
+                ctx,
+                Ino::from(inode),
+                flags.bits(),
+                atime,
+                mtime,
+                mode,
+                uid,
+                gid,
+                size,
+                fh,
+                None,
+            ))
+            .map_err(to_io)?;
         let ttl = *self.vfs.get_entry_ttl(new.kind);
         Ok((attr_to_stat64(&new, inode), ttl))
     }
 
-    async fn async_open(
+    fn readlink(&self, ctx: &Context, inode: Self::Inode) -> io::Result<Vec<u8>> {
+        let ctx = self.ctx(ctx);
+        let target = self
+            .vfs_rt
+            .block_on(self.vfs.readlink(ctx, Ino::from(inode)))
+            .map_err(to_io)?;
+        Ok(target.to_vec())
+    }
+
+    fn symlink(
+        &self,
+        ctx: &Context,
+        linkname: &CStr,
+        parent: Self::Inode,
+        name: &CStr,
+    ) -> io::Result<Entry> {
+        let target = Self::cstr(linkname)?;
+        let name = Self::cstr(name)?;
+        let ctx = self.ctx(ctx);
+        let fe = self
+            .vfs_rt
+            .block_on(
+                self.vfs
+                    .symlink(ctx, Ino::from(parent), name, Path::new(target)),
+            )
+            .map_err(to_io)?;
+        Ok(self.build_entry(&fe))
+    }
+
+    fn mknod(
+        &self,
+        ctx: &Context,
+        parent: Self::Inode,
+        name: &CStr,
+        mode: u32,
+        rdev: u32,
+        umask: u32,
+    ) -> io::Result<Entry> {
+        let name = Self::cstr(name)?.to_owned();
+        let ctx = self.ctx(ctx);
+        let fe = self
+            .vfs_rt
+            .block_on(
+                self.vfs
+                    .mknod(ctx, Ino::from(parent), name, mode, umask, rdev),
+            )
+            .map_err(to_io)?;
+        Ok(self.build_entry(&fe))
+    }
+
+    fn mkdir(
+        &self,
+        ctx: &Context,
+        parent: Self::Inode,
+        name: &CStr,
+        mode: u32,
+        umask: u32,
+    ) -> io::Result<Entry> {
+        let name = Self::cstr(name)?;
+        let ctx = self.ctx(ctx);
+        let fe = self
+            .vfs_rt
+            .block_on(self.vfs.mkdir(ctx, Ino::from(parent), name, mode, umask))
+            .map_err(to_io)?;
+        Ok(self.build_entry(&fe))
+    }
+
+    fn unlink(&self, ctx: &Context, parent: Self::Inode, name: &CStr) -> io::Result<()> {
+        let name = Self::cstr(name)?;
+        let ctx = self.ctx(ctx);
+        self.vfs_rt
+            .block_on(self.vfs.unlink(ctx, Ino::from(parent), name))
+            .map_err(to_io)
+    }
+
+    fn rmdir(&self, ctx: &Context, parent: Self::Inode, name: &CStr) -> io::Result<()> {
+        let name = Self::cstr(name)?;
+        let ctx = self.ctx(ctx);
+        self.vfs_rt
+            .block_on(self.vfs.rmdir(ctx, Ino::from(parent), name))
+            .map_err(to_io)
+    }
+
+    fn rename(
+        &self,
+        ctx: &Context,
+        olddir: Self::Inode,
+        oldname: &CStr,
+        newdir: Self::Inode,
+        newname: &CStr,
+        flags: u32,
+    ) -> io::Result<()> {
+        let oldname = Self::cstr(oldname)?;
+        let newname = Self::cstr(newname)?;
+        let ctx = self.ctx(ctx);
+        self.vfs_rt
+            .block_on(self.vfs.rename(
+                ctx,
+                Ino::from(olddir),
+                oldname,
+                Ino::from(newdir),
+                newname,
+                flags,
+            ))
+            .map_err(to_io)
+    }
+
+    fn link(
+        &self,
+        ctx: &Context,
+        inode: Self::Inode,
+        newparent: Self::Inode,
+        newname: &CStr,
+    ) -> io::Result<Entry> {
+        let newname = Self::cstr(newname)?;
+        let ctx = self.ctx(ctx);
+        let fe = self
+            .vfs_rt
+            .block_on(
+                self.vfs
+                    .link(ctx, Ino::from(inode), Ino::from(newparent), newname),
+            )
+            .map_err(to_io)?;
+        Ok(self.build_entry(&fe))
+    }
+
+    fn open(
         &self,
         ctx: &Context,
         inode: Self::Inode,
         flags: u32,
         _fuse_flags: u32,
-    ) -> io::Result<(Option<Self::Handle>, OpenOptions)> {
-        let cctx = self.ctx(ctx);
-        let vfs = self.vfs.clone();
+    ) -> io::Result<(Option<Self::Handle>, OpenOptions, Option<u32>)> {
+        let cctx = FuseContext::from_uid_gid_pid(ctx.uid, ctx.gid, ctx.pid as u32);
         let opened = self
-            .run(async move {
-                vfs.open(&cctx, Ino::from(inode), flags as i32)
-                    .await
-                    .map_err(|e| e.to_errno())
-            })
-            .await?;
-        Ok((Some(opened.fh), OpenOptions::empty()))
+            .vfs_rt
+            .block_on(self.vfs.open(&cctx, Ino::from(inode), flags as i32))
+            .map_err(to_io)?;
+        Ok((Some(opened.fh), OpenOptions::empty(), None))
     }
 
-    async fn async_create(
+    fn create(
         &self,
         ctx: &Context,
         parent: Self::Inode,
         name: &CStr,
         args: CreateIn,
-    ) -> io::Result<(Entry, Option<Self::Handle>, OpenOptions)> {
-        let name = name
-            .to_str()
-            .map_err(|_| errno_io(libc::EINVAL))?
-            .to_owned();
-        let cctx = Arc::new(self.ctx(ctx));
-        let vfs = self.vfs.clone();
+    ) -> io::Result<(Entry, Option<Self::Handle>, OpenOptions, Option<u32>)> {
+        let name = Self::cstr(name)?;
+        let ctx = self.ctx(ctx);
         let (fe, fh) = self
-            .run(async move {
-                vfs.create(
-                    cctx,
-                    Ino::from(parent),
-                    &name,
-                    args.mode,
-                    args.umask,
-                    args.flags as i32,
-                )
-                .await
-                .map_err(|e| e.to_errno())
-            })
-            .await?;
-        Ok((self.build_entry(&fe), Some(fh), OpenOptions::empty()))
+            .vfs_rt
+            .block_on(self.vfs.create(
+                ctx,
+                Ino::from(parent),
+                name,
+                args.mode,
+                args.umask,
+                args.flags as i32,
+            ))
+            .map_err(to_io)?;
+        Ok((self.build_entry(&fe), Some(fh), OpenOptions::empty(), None))
     }
 
-    async fn async_read(
+    #[allow(clippy::too_many_arguments)]
+    fn read(
         &self,
         ctx: &Context,
         inode: Self::Inode,
         handle: Self::Handle,
-        w: &mut (dyn AsyncZeroCopyWriter + Send),
+        w: &mut dyn ZeroCopyWriter,
         size: u32,
         offset: u64,
         lock_owner: Option<u64>,
         flags: u32,
     ) -> io::Result<usize> {
-        let cctx = Arc::new(self.ctx(ctx));
-        let vfs = self.vfs.clone();
+        let ctx = self.ctx(ctx);
         let data = self
-            .run(async move {
-                vfs.read(
-                    cctx,
-                    Ino::from(inode),
-                    handle,
-                    offset as i64,
-                    size,
-                    flags as i32,
-                    lock_owner,
-                )
-                .await
-                .map_err(|e| e.to_errno())
-            })
-            .await?;
+            .vfs_rt
+            .block_on(self.vfs.read(
+                ctx,
+                Ino::from(inode),
+                handle,
+                offset as i64,
+                size,
+                flags as i32,
+                lock_owner,
+            ))
+            .map_err(to_io)?;
         w.write_all(&data)?;
         Ok(data.len())
     }
 
-    async fn async_write(
+    #[allow(clippy::too_many_arguments)]
+    fn write(
         &self,
         ctx: &Context,
         inode: Self::Inode,
         handle: Self::Handle,
-        r: &mut (dyn AsyncZeroCopyReader + Send),
+        r: &mut dyn ZeroCopyReader,
         size: u32,
         offset: u64,
         lock_owner: Option<u64>,
@@ -750,45 +487,50 @@ impl AsyncFileSystem for KisekiFsBackend {
     ) -> io::Result<usize> {
         let mut buf = vec![0u8; size as usize];
         r.read_exact(&mut buf)?;
-        let cctx = Arc::new(self.ctx(ctx));
-        let vfs = self.vfs.clone();
+        let ctx = self.ctx(ctx);
         let written = self
-            .run(async move {
-                vfs.write(
-                    cctx,
-                    Ino::from(inode),
-                    handle,
-                    offset as i64,
-                    &buf,
-                    0,
-                    flags as i32,
-                    lock_owner,
-                )
-                .await
-                .map_err(|e| e.to_errno())
-            })
-            .await?;
+            .vfs_rt
+            .block_on(self.vfs.write(
+                ctx,
+                Ino::from(inode),
+                handle,
+                offset as i64,
+                &buf,
+                0,
+                flags as i32,
+                lock_owner,
+            ))
+            .map_err(to_io)?;
         Ok(written as usize)
     }
 
-    async fn async_fsync(
+    fn flush(
+        &self,
+        ctx: &Context,
+        inode: Self::Inode,
+        handle: Self::Handle,
+        lock_owner: u64,
+    ) -> io::Result<()> {
+        let ctx = self.ctx(ctx);
+        self.vfs_rt
+            .block_on(self.vfs.flush(ctx, Ino::from(inode), handle, lock_owner))
+            .map_err(to_io)
+    }
+
+    fn fsync(
         &self,
         ctx: &Context,
         inode: Self::Inode,
         datasync: bool,
         handle: Self::Handle,
     ) -> io::Result<()> {
-        let cctx = Arc::new(self.ctx(ctx));
-        let vfs = self.vfs.clone();
-        self.run(async move {
-            vfs.fsync(cctx, Ino::from(inode), handle, datasync)
-                .await
-                .map_err(|e| e.to_errno())
-        })
-        .await
+        let ctx = self.ctx(ctx);
+        self.vfs_rt
+            .block_on(self.vfs.fsync(ctx, Ino::from(inode), handle, datasync))
+            .map_err(to_io)
     }
 
-    async fn async_fallocate(
+    fn fallocate(
         &self,
         ctx: &Context,
         inode: Self::Inode,
@@ -797,38 +539,145 @@ impl AsyncFileSystem for KisekiFsBackend {
         offset: u64,
         length: u64,
     ) -> io::Result<()> {
-        let cctx = Arc::new(self.ctx(ctx));
-        let vfs = self.vfs.clone();
-        self.run(async move {
-            vfs.fallocate(
-                cctx,
+        let ctx = self.ctx(ctx);
+        self.vfs_rt
+            .block_on(self.vfs.fallocate(
+                ctx,
                 Ino::from(inode),
                 handle,
                 offset as i64,
                 length as i64,
                 mode as i32,
-            )
-            .await
-            .map_err(|e| e.to_errno())
-        })
-        .await
+            ))
+            .map_err(to_io)
     }
 
-    async fn async_fsyncdir(
+    fn release(
         &self,
         ctx: &Context,
         inode: Self::Inode,
-        datasync: bool,
+        _flags: u32,
+        handle: Self::Handle,
+        _flush: bool,
+        _flock_release: bool,
+        _lock_owner: Option<u64>,
+    ) -> io::Result<()> {
+        let ctx = self.ctx(ctx);
+        // The returned JoinHandle drives background finalisation; not awaited
+        // here (matches the fuser layer).
+        self.vfs_rt
+            .block_on(self.vfs.release(ctx, Ino::from(inode), handle))
+            .map(|_| ())
+            .map_err(to_io)
+    }
+
+    fn opendir(
+        &self,
+        ctx: &Context,
+        inode: Self::Inode,
+        flags: u32,
+    ) -> io::Result<(Option<Self::Handle>, OpenOptions)> {
+        let cctx = FuseContext::from_uid_gid_pid(ctx.uid, ctx.gid, ctx.pid as u32);
+        let fh = self
+            .vfs_rt
+            .block_on(self.vfs.open_dir(&cctx, Ino::from(inode), flags as i32))
+            .map_err(to_io)?;
+        Ok((Some(fh), OpenOptions::empty()))
+    }
+
+    fn readdir(
+        &self,
+        ctx: &Context,
+        inode: Self::Inode,
+        handle: Self::Handle,
+        _size: u32,
+        offset: u64,
+        add_entry: &mut dyn FnMut(DirEntry) -> io::Result<usize>,
+    ) -> io::Result<()> {
+        let cctx = FuseContext::from_uid_gid_pid(ctx.uid, ctx.gid, ctx.pid as u32);
+        let entries = self
+            .vfs_rt
+            .block_on(
+                self.vfs
+                    .read_dir(&cctx, Ino::from(inode), handle, offset as i64, false),
+            )
+            .map_err(to_io)?;
+        for (next, e) in (offset + 1..).zip(entries.iter()) {
+            let de = DirEntry {
+                ino:    e.get_inode().0,
+                offset: next,
+                type_:  dir_entry_type(e.get_file_type()),
+                name:   e.get_name().as_bytes(),
+            };
+            if add_entry(de)? == 0 {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn readdirplus(
+        &self,
+        ctx: &Context,
+        inode: Self::Inode,
+        handle: Self::Handle,
+        _size: u32,
+        offset: u64,
+        add_entry: &mut dyn FnMut(DirEntry, Entry) -> io::Result<usize>,
+    ) -> io::Result<()> {
+        let cctx = FuseContext::from_uid_gid_pid(ctx.uid, ctx.gid, ctx.pid as u32);
+        let entries = self
+            .vfs_rt
+            .block_on(
+                self.vfs
+                    .read_dir(&cctx, Ino::from(inode), handle, offset as i64, true),
+            )
+            .map_err(to_io)?;
+        for (next, e) in (offset + 1..).zip(entries.iter()) {
+            let KisekiEntry::Full(fe) = e else { continue };
+            let de = DirEntry {
+                ino:    fe.inode.0,
+                offset: next,
+                type_:  dir_entry_type(fe.attr.kind),
+                name:   fe.name.as_bytes(),
+            };
+            if add_entry(de, self.build_entry(fe))? == 0 {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn releasedir(
+        &self,
+        _ctx: &Context,
+        inode: Self::Inode,
+        _flags: u32,
         handle: Self::Handle,
     ) -> io::Result<()> {
-        // Directory metadata is published synchronously; treat like fsync.
-        let cctx = Arc::new(self.ctx(ctx));
-        let vfs = self.vfs.clone();
-        self.run(async move {
-            vfs.fsync(cctx, Ino::from(inode), handle, datasync)
-                .await
-                .map_err(|e| e.to_errno())
-        })
-        .await
+        self.vfs_rt
+            .block_on(self.vfs.release_dir(Ino::from(inode), handle))
+            .map_err(to_io)
+    }
+
+    fn statfs(&self, ctx: &Context, inode: Self::Inode) -> io::Result<statvfs64> {
+        let ctx = self.ctx(ctx);
+        let state = self.vfs.stat_fs(ctx, Ino::from(inode)).map_err(to_io)?;
+
+        let total_blocks = (state.total_size / BLOCK_SIZE as u64).max(1);
+        let used_blocks = state.used_size / BLOCK_SIZE as u64;
+        let avail_blocks = total_blocks.saturating_sub(used_blocks);
+
+        let mut st: statvfs64 = zeroed_pod();
+        st.f_bsize = BLOCK_SIZE as u64;
+        st.f_frsize = BLOCK_SIZE as u64;
+        st.f_blocks = total_blocks;
+        st.f_bfree = avail_blocks;
+        st.f_bavail = avail_blocks;
+        st.f_files = u64::MAX;
+        st.f_ffree = u64::MAX - state.file_count;
+        st.f_favail = u64::MAX - state.file_count;
+        st.f_namemax = MAX_NAME_LENGTH as u64;
+        Ok(st)
     }
 }
