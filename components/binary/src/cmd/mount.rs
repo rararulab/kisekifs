@@ -901,6 +901,11 @@ fn mount(args: MountArgs) -> Result<(), Whatever> {
     let unmount_error = should_unmount.then(|| unmounter.unmount().err()).flatten();
 
     let session_error = join_session_until(session_guard, termination_deadline);
+    let detach_error = if should_unmount && session_error.is_some() {
+        detach_mount_after_timeout(&args.mount_point)
+    } else {
+        None
+    };
     let shutdown_result = initiated_shutdown.unwrap_or_else(|| {
         shutdown_runtime.block_on(file_system.shutdown(file_system.config.shutdown_deadline))
     });
@@ -915,6 +920,9 @@ fn mount(args: MountArgs) -> Result<(), Whatever> {
     if let Some(error) = session_error {
         terminal_errors.push(error);
     }
+    if let Some(error) = detach_error {
+        terminal_errors.push(error);
+    }
     if let Err(error) = shutdown_result {
         terminal_errors.push(format!("mount shutdown failed: {error}"));
     }
@@ -926,6 +934,19 @@ fn mount(args: MountArgs) -> Result<(), Whatever> {
     }
     Ok(())
 }
+
+#[cfg(target_os = "linux")]
+fn detach_mount_after_timeout(mount_point: &Path) -> Option<String> {
+    match rustix::mount::unmount(mount_point, rustix::mount::UnmountFlags::DETACH) {
+        Ok(()) | Err(rustix::io::Errno::INVAL | rustix::io::Errno::NOENT) => None,
+        Err(error) => Some(format!(
+            "failed to detach FUSE mount after session timeout: {error}"
+        )),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn detach_mount_after_timeout(_mount_point: &Path) -> Option<String> { None }
 
 async fn wait_for_shutdown_request(requested: Arc<AtomicBool>) {
     while !requested.load(Ordering::Acquire) {
