@@ -298,7 +298,7 @@ impl MountArgs {
                 // Stop Agent
                 let agent_ready = agent_running
                     .stop()
-                    .with_whatever_context(|e| format!("failed to stop pyroscope agent {} ", e))?;
+                    .with_whatever_context(|e| format!("failed to stop pyroscope agent {e} "))?;
 
                 // Shutdown the Agent
                 agent_ready.shutdown();
@@ -333,14 +333,14 @@ fn mount(args: MountArgs) -> Result<(), Whatever> {
     validate_mount_point(&args.mount_point)?;
 
     let meta = kiseki_meta::open(meta_config)
-        .with_whatever_context(|e| format!("failed to open meta, {:?}", e))?;
+        .with_whatever_context(|e| format!("failed to open meta, {e:?}"))?;
     let startup_runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .with_whatever_context(|error| format!("failed to build startup runtime: {error}"))?;
     let file_system = startup_runtime
         .block_on(KisekiVFS::new_checked(vfs_config, meta))
-        .with_whatever_context(|e| format!("failed to create file system, {:?}", e))?;
+        .with_whatever_context(|e| format!("failed to create file system, {e:?}"))?;
     drop(startup_runtime);
 
     let fs = kiseki_fuse::KisekiFuse::create(fuse_config.clone(), file_system)?;

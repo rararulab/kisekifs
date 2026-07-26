@@ -49,7 +49,7 @@ impl AddAssign for Ino {
 }
 
 impl Add for Ino {
-    type Output = Ino;
+    type Output = Self;
 
     fn add(self, rhs: Self) -> Self::Output { Self(self.0 + rhs.0) }
 }
@@ -66,9 +66,9 @@ impl Ino {
 
     pub fn is_normal(&self) -> bool { !self.is_special() }
 
-    pub fn is_zero(&self) -> bool { self.0 == 0 }
+    pub const fn is_zero(&self) -> bool { self.0 == 0 }
 
-    pub fn is_root(&self) -> bool { self.0 == ROOT_INO.0 }
+    pub const fn is_root(&self) -> bool { self.0 == ROOT_INO.0 }
 
     // FIXME: use a better way
     // key: AiiiiiiiiI
@@ -81,11 +81,7 @@ impl Ino {
         buf
     }
 
-    pub fn generate_key_str(&self) -> String {
-        // let key_buf = self.generate_key();
-        // String::from_utf8_lossy(&key_buf).to_string()
-        format!("A{:x}I", self.0)
-    }
+    pub fn generate_key_str(&self) -> String { format!("A{:x}I", self.0) }
 }
 
 #[cfg(test)]
@@ -95,8 +91,8 @@ mod tests {
     #[test]
     fn ino() {
         let key = ROOT_INO.generate_key();
-        println!("{:?}", key);
+        println!("{key:?}");
         let key_str = ROOT_INO.generate_key_str();
-        println!("{:?}", key_str)
+        println!("{key_str:?}");
     }
 }

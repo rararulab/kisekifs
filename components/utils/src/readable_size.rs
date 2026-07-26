@@ -41,11 +41,11 @@ pub const PIB: u64 = TIB * BINARY_DATA_MAGNITUDE;
 pub struct ReadableSize(pub u64);
 
 impl ReadableSize {
-    pub const fn kb(count: u64) -> ReadableSize { ReadableSize(count * KIB) }
+    pub const fn kb(count: u64) -> Self { Self(count * KIB) }
 
-    pub const fn mb(count: u64) -> ReadableSize { ReadableSize(count * MIB) }
+    pub const fn mb(count: u64) -> Self { Self(count * MIB) }
 
-    pub const fn gb(count: u64) -> ReadableSize { ReadableSize(count * GIB) }
+    pub const fn gb(count: u64) -> Self { Self(count * GIB) }
 
     pub const fn as_mb(self) -> u64 { self.0 / MIB }
 
@@ -55,21 +55,21 @@ impl ReadableSize {
 }
 
 impl Div<u64> for ReadableSize {
-    type Output = ReadableSize;
+    type Output = Self;
 
-    fn div(self, rhs: u64) -> ReadableSize { ReadableSize(self.0 / rhs) }
+    fn div(self, rhs: u64) -> Self { Self(self.0 / rhs) }
 }
 
-impl Div<ReadableSize> for ReadableSize {
+impl Div<Self> for ReadableSize {
     type Output = u64;
 
-    fn div(self, rhs: ReadableSize) -> u64 { self.0 / rhs.0 }
+    fn div(self, rhs: Self) -> u64 { self.0 / rhs.0 }
 }
 
 impl Mul<u64> for ReadableSize {
-    type Output = ReadableSize;
+    type Output = Self;
 
-    fn mul(self, rhs: u64) -> ReadableSize { ReadableSize(self.0 * rhs) }
+    fn mul(self, rhs: u64) -> Self { Self(self.0 * rhs) }
 }
 
 impl Serialize for ReadableSize {
@@ -80,7 +80,7 @@ impl Serialize for ReadableSize {
         let size = self.0;
         let mut buffer = String::new();
         if size == 0 {
-            write!(buffer, "{}KiB", size).unwrap();
+            write!(buffer, "{size}KiB").unwrap();
         } else if size.is_multiple_of(PIB) {
             write!(buffer, "{}PiB", size / PIB).unwrap();
         } else if size.is_multiple_of(TIB) {
@@ -102,14 +102,14 @@ impl FromStr for ReadableSize {
     type Err = String;
 
     // This method parses value in binary unit.
-    fn from_str(s: &str) -> Result<ReadableSize, String> {
+    fn from_str(s: &str) -> Result<Self, String> {
         let size_str = s.trim();
         if size_str.is_empty() {
-            return Err(format!("{:?} is not a valid size.", s));
+            return Err(format!("{s:?} is not a valid size."));
         }
 
         if !size_str.is_ascii() {
-            return Err(format!("ASCII string is expected, but got {:?}", s));
+            return Err(format!("ASCII string is expected, but got {s:?}"));
         }
 
         // size: digits and '.' as decimal separator
@@ -131,21 +131,20 @@ impl FromStr for ReadableSize {
             "B" | "" => B,
             _ => {
                 return Err(format!(
-                    "only B, KB, KiB, MB, MiB, GB, GiB, TB, TiB, PB, and PiB are supported: {:?}",
-                    s
+                    "only B, KB, KiB, MB, MiB, GB, GiB, TB, TiB, PB, and PiB are supported: {s:?}"
                 ));
             }
         };
 
         match size.parse::<f64>() {
-            Ok(n) => Ok(ReadableSize((n * unit as f64) as u64)),
-            Err(_) => Err(format!("invalid size string: {:?}", s)),
+            Ok(n) => Ok(Self((n * unit as f64) as u64)),
+            Err(_) => Err(format!("invalid size string: {s:?}")),
         }
     }
 }
 
 impl Debug for ReadableSize {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "{}", self) }
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "{self}") }
 }
 
 impl Display for ReadableSize {

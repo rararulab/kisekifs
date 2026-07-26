@@ -453,7 +453,7 @@ mod tests {
         range_map.insert(0..10, 1);
         range_map.insert(10..12, 2);
         range_map.iter().for_each(|(r, v)| {
-            println!("{:?} -> {:?}", r, v);
+            println!("{r:?} -> {v:?}");
         });
     }
 
@@ -486,10 +486,10 @@ mod tests {
         for (r, vs) in virtual_slice_map {
             match vs {
                 VirtualSlice::Hole => {
-                    println!("find hole in range: {:?}", r);
+                    println!("find hole in range: {r:?}");
                 }
                 VirtualSlice::Slice(s) => {
-                    println!("find slice in range: {:?}, slice: {:?}", r, s);
+                    println!("find slice in range: {r:?}, slice: {s:?}");
                 }
             }
         }
@@ -674,7 +674,7 @@ mod tests {
         let write_len = data_manager
             .write(inode, 0, data)
             .await
-            .map_err(|e| println!("{}", e))
+            .map_err(|e| println!("{e}"))
             .unwrap();
 
         let fw = data_manager.find_file_writer(inode).unwrap();
@@ -694,7 +694,7 @@ mod tests {
         let write_len = data_manager
             .write(inode, chunk_size - 3, data)
             .await
-            .map_err(|e| println!("{}", e))
+            .map_err(|e| println!("{e}"))
             .unwrap();
         assert_eq!(write_len, data.len());
 
@@ -724,7 +724,7 @@ mod tests {
         let tempdir = tempfile::tempdir().unwrap();
         let format = Format::default();
         let temppath = tempdir.path().to_str().unwrap();
-        meta_config.dsn = format!("rocksdb://:{}", temppath);
+        meta_config.dsn = format!("rocksdb://:{temppath}");
         kiseki_meta::update_format(&meta_config.dsn, format.clone(), true).unwrap();
 
         let meta_engine = kiseki_meta::open(meta_config).unwrap();

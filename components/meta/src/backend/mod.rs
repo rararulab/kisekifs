@@ -58,7 +58,7 @@ impl BackendKinds {
     fn build(&self, path: &str, skip_dir_mtime: Duration) -> Result<BackendRef> {
         match self {
             #[cfg(feature = "meta-rocksdb")]
-            BackendKinds::Rocksdb => {
+            Self::Rocksdb => {
                 let mut builder = rocksdb::Builder::default();
                 builder.with_path(path).with_skip_dir_mtime(skip_dir_mtime);
                 debug!("backend [rocksdb] is built with path: {}", path);

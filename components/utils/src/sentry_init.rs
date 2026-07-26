@@ -32,7 +32,7 @@ pub struct SentryConfig {
 impl SentryConfig {
     pub fn from_environment() -> Result<Self, Whatever> {
         let dsn = var("SENTRY_DSN")?.into_dsn().with_whatever_context(|e| {
-            format!("SENTRY_DSN_API is not a valid Sentry DSN value {}", e)
+            format!("SENTRY_DSN_API is not a valid Sentry DSN value {e}")
         })?;
 
         let environment =
@@ -73,7 +73,7 @@ pub fn init_sentry() -> Option<ClientInitGuard> {
         }
     };
 
-    println!("found sentry config: {:?}", config);
+    println!("found sentry config: {config:?}");
 
     let opts = sentry::ClientOptions {
         auto_session_tracking: true,

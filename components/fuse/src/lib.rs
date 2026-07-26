@@ -178,7 +178,7 @@ impl KisekiFuse {
             );
         }
 
-        reply.attr(self.vfs.get_entry_ttl(attr.kind), &attr.to_fuse_attr(inode))
+        reply.attr(self.vfs.get_entry_ttl(attr.kind), &attr.to_fuse_attr(inode));
     }
 }
 
@@ -238,7 +238,7 @@ impl Filesystem for KisekiFuse {
             Ok(attr) => self.reply_attr(&EMPTY_CONTEXT, reply, Ino(ino), attr, true),
             Err(e) => {
                 error!("getattr {ino:?} {e:?}");
-                reply.error(e.to_errno())
+                reply.error(e.to_errno());
             }
         };
     }
@@ -492,7 +492,7 @@ impl Filesystem for KisekiFuse {
             }
             Err(e) => {
                 error!("read {:?} {:?}", Ino(ino), e);
-                reply.error(e.to_errno())
+                reply.error(e.to_errno());
             }
         }
 
@@ -765,7 +765,7 @@ impl Filesystem for KisekiFuse {
 
         match self.runtime.block_on(
             self.vfs
-                .create(ctx.clone(), Ino(parent), &name, mode, umask, flags)
+                .create(ctx, Ino(parent), &name, mode, umask, flags)
                 .in_current_span(),
         ) {
             Ok((entry, fh)) => reply.created(

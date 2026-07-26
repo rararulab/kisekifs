@@ -359,7 +359,7 @@ mod file_operations {
         #[case] _desc: &str,
     ) -> Result<()> {
         let env = vfs_env.await;
-        let filename = format!("file_{}_bytes", size);
+        let filename = format!("file_{size}_bytes");
         let (entry, fh) =
             test_utils::create_test_file(&env.vfs, env.ctx.clone(), ROOT_INO, &filename, 0o644)
                 .await?;
@@ -1018,12 +1018,7 @@ mod concurrent_operations {
                     .release(ctx_clone, opened.inode, opened.fh)
                     .await?;
 
-                assert_eq!(
-                    read_data.as_ref(),
-                    initial_data,
-                    "任务{}读取的数据应一致",
-                    i
-                );
+                assert_eq!(read_data.as_ref(), initial_data, "任务{i}读取的数据应一致");
                 Ok(())
             });
         }
@@ -1053,7 +1048,7 @@ mod concurrent_operations {
             let ctx_clone = ctx.clone();
 
             tasks.spawn(async move {
-                let dir_name = format!("concurrent_dir_{}", i);
+                let dir_name = format!("concurrent_dir_{i}");
                 let dir = vfs_clone
                     .mkdir(ctx_clone.clone(), ROOT_INO, &dir_name, 0o755, 0)
                     .await?;
@@ -1143,7 +1138,7 @@ mod boundary_conditions {
         #[case] _desc: &str,
     ) -> Result<()> {
         let env = vfs_env.await;
-        let filename = format!("edge_file_{}", size);
+        let filename = format!("edge_file_{size}");
         let (file, fh) =
             test_utils::create_test_file(&env.vfs, env.ctx.clone(), ROOT_INO, &filename, 0o644)
                 .await?;
@@ -1385,7 +1380,7 @@ mod attribute_operations {
         #[case] _desc: &str,
     ) -> Result<()> {
         let env = vfs_env.await;
-        let filename = format!("perm_test_{:o}", mode);
+        let filename = format!("perm_test_{mode:o}");
         let (file, fh) =
             test_utils::create_test_file(&env.vfs, env.ctx.clone(), ROOT_INO, &filename, mode)
                 .await?;
@@ -1420,7 +1415,7 @@ mod performance_tests {
 
         // 创建多个文件并测量性能
         for i in 0..file_count {
-            let filename = format!("perf_file_{}", i);
+            let filename = format!("perf_file_{i}");
             let (file, fh) =
                 test_utils::create_test_file(&vfs, ctx.clone(), ROOT_INO, &filename, 0o644).await?;
             vfs.release(ctx.clone(), file.inode, fh).await?;
@@ -1432,11 +1427,10 @@ mod performance_tests {
         // 验证性能至少达到合理水平 (比如每秒50个文件)
         assert!(
             files_per_sec > 50.0,
-            "文件创建性能太低：{:.2} files/sec",
-            files_per_sec
+            "文件创建性能太低：{files_per_sec:.2} files/sec"
         );
 
-        println!("文件创建性能：{:.2} files/sec", files_per_sec);
+        println!("文件创建性能：{files_per_sec:.2} files/sec");
 
         Ok(())
     }
@@ -1451,7 +1445,7 @@ mod performance_tests {
 
         // 创建多个目录
         for i in 0..dir_count {
-            let dirname = format!("perf_dir_{}", i);
+            let dirname = format!("perf_dir_{i}");
             let _dir = vfs.mkdir(ctx.clone(), ROOT_INO, &dirname, 0o755, 0).await?;
         }
 
@@ -1470,22 +1464,20 @@ mod performance_tests {
         // 验证目录创建性能
         assert!(
             dirs_per_sec > 100.0,
-            "目录创建性能太低：{:.2} dirs/sec",
-            dirs_per_sec
+            "目录创建性能太低：{dirs_per_sec:.2} dirs/sec"
         );
 
         // 验证目录列举性能 (应该很快)
         assert!(
             list_elapsed.as_millis() < 100,
-            "目录列举太慢：{:?}",
-            list_elapsed
+            "目录列举太慢：{list_elapsed:?}"
         );
 
         // 验证列举结果正确
         assert_eq!(entries.len(), dir_count, "列举的目录数应匹配");
 
-        println!("目录创建性能：{:.2} dirs/sec", dirs_per_sec);
-        println!("目录列举性能：{:?}", list_elapsed);
+        println!("目录创建性能：{dirs_per_sec:.2} dirs/sec");
+        println!("目录列举性能：{list_elapsed:?}");
 
         Ok(())
     }
@@ -1527,17 +1519,15 @@ mod performance_tests {
         // 验证I/O性能至少达到1MB/s (这是很保守的要求)
         assert!(
             write_throughput > 1.0,
-            "写入吞吐量太低：{:.2} MB/s",
-            write_throughput
+            "写入吞吐量太低：{write_throughput:.2} MB/s"
         );
         assert!(
             read_throughput > 1.0,
-            "读取吞吐量太低：{:.2} MB/s",
-            read_throughput
+            "读取吞吐量太低：{read_throughput:.2} MB/s"
         );
 
-        println!("写入性能：{:.2} MB/s", write_throughput);
-        println!("读取性能：{:.2} MB/s", read_throughput);
+        println!("写入性能：{write_throughput:.2} MB/s");
+        println!("读取性能：{read_throughput:.2} MB/s");
 
         // 清理
         vfs.release(ctx.clone(), file.inode, fh).await?;

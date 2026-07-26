@@ -53,12 +53,12 @@ impl From<Counter> for Vec<u8> {
 impl AsRef<[u8]> for Counter {
     fn as_ref(&self) -> &[u8] {
         match self {
-            Counter::UsedSpace => USED_SPACE.as_bytes(),
-            Counter::TotalInodes => TOTAL_INODES.as_bytes(),
-            Counter::LegacySessions => LEGACY_SESSIONS.as_bytes(),
-            Counter::NextTrash => NEXT_TRASH.as_bytes(),
-            Counter::NextInode => NEXT_INODE.as_bytes(),
-            Counter::NextSlice => NEXT_SLICE.as_bytes(),
+            Self::UsedSpace => USED_SPACE.as_bytes(),
+            Self::TotalInodes => TOTAL_INODES.as_bytes(),
+            Self::LegacySessions => LEGACY_SESSIONS.as_bytes(),
+            Self::NextTrash => NEXT_TRASH.as_bytes(),
+            Self::NextInode => NEXT_INODE.as_bytes(),
+            Self::NextSlice => NEXT_SLICE.as_bytes(),
         }
     }
 }
@@ -66,9 +66,9 @@ impl AsRef<[u8]> for Counter {
 impl Counter {
     pub fn get_step(&self) -> usize {
         match self {
-            Counter::NextTrash => 1,
-            Counter::NextInode => 1 << 10,
-            Counter::NextSlice => 4 << 10,
+            Self::NextTrash => 1,
+            Self::NextInode => 1 << 10,
+            Self::NextSlice => 4 << 10,
             _ => panic!("Counter {self:?} does not have a step"),
         }
     }

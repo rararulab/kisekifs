@@ -39,7 +39,7 @@ pub struct FullEntry {
 
 impl FullEntry {
     pub fn new(ino: Ino, name: &str, attr: InodeAttr) -> Self {
-        FullEntry {
+        Self {
             inode: ino,
             name: name.to_string(),
             attr,
@@ -61,15 +61,15 @@ pub struct DEntry {
 }
 
 impl Entry {
-    pub fn new_basic_entry_pair(ino: Ino, parent: Ino) -> Vec<Entry> {
+    pub fn new_basic_entry_pair(ino: Ino, parent: Ino) -> Vec<Self> {
         vec![
-            Entry::DEntry(DEntry {
+            Self::DEntry(DEntry {
                 parent: ZERO_INO,
                 name:   DOT.to_string(),
                 inode:  ino,
                 typ:    FileType::Directory,
             }),
-            Entry::DEntry(DEntry {
+            Self::DEntry(DEntry {
                 parent: ZERO_INO,
                 name:   DOT_DOT.to_string(),
                 inode:  parent,
@@ -78,31 +78,31 @@ impl Entry {
         ]
     }
 
-    pub fn get_inode(&self) -> Ino {
+    pub const fn get_inode(&self) -> Ino {
         match self {
-            Entry::Full(e) => e.inode,
-            Entry::DEntry(e) => e.inode,
+            Self::Full(e) => e.inode,
+            Self::DEntry(e) => e.inode,
         }
     }
 
     pub fn is_file(&self) -> bool {
         match self {
-            Entry::Full(e) => e.attr.kind == FileType::RegularFile,
-            Entry::DEntry(e) => e.typ == FileType::RegularFile,
+            Self::Full(e) => e.attr.kind == FileType::RegularFile,
+            Self::DEntry(e) => e.typ == FileType::RegularFile,
         }
     }
 
-    pub fn get_file_type(&self) -> FileType {
+    pub const fn get_file_type(&self) -> FileType {
         match self {
-            Entry::Full(e) => e.attr.kind,
-            Entry::DEntry(e) => e.typ,
+            Self::Full(e) => e.attr.kind,
+            Self::DEntry(e) => e.typ,
         }
     }
 
     pub fn get_name(&self) -> &str {
         match self {
-            Entry::Full(e) => &e.name,
-            Entry::DEntry(e) => &e.name,
+            Self::Full(e) => &e.name,
+            Self::DEntry(e) => &e.name,
         }
     }
 }

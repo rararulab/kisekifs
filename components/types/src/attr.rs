@@ -83,62 +83,62 @@ pub struct InodeAttr {
 
 // Setter
 impl InodeAttr {
-    pub fn set_flags(&mut self, flags: u32) -> &mut Self {
+    pub const fn set_flags(&mut self, flags: u32) -> &mut Self {
         self.flags = flags;
         self
     }
 
-    pub fn set_mode(&mut self, perm: u32) -> &mut Self {
+    pub const fn set_mode(&mut self, perm: u32) -> &mut Self {
         self.mode = perm;
         self
     }
 
-    pub fn set_kind(&mut self, kind: fuser::FileType) -> &mut Self {
+    pub const fn set_kind(&mut self, kind: fuser::FileType) -> &mut Self {
         self.kind = kind;
         self
     }
 
-    pub fn set_nlink(&mut self, nlink: u32) -> &mut Self {
+    pub const fn set_nlink(&mut self, nlink: u32) -> &mut Self {
         self.nlink = nlink;
         self
     }
 
-    pub fn set_length(&mut self, length: u64) -> &mut Self {
+    pub const fn set_length(&mut self, length: u64) -> &mut Self {
         self.length = length;
         self
     }
 
-    pub fn set_rdev(&mut self, rdev: u32) -> &mut Self {
+    pub const fn set_rdev(&mut self, rdev: u32) -> &mut Self {
         self.rdev = rdev;
         self
     }
 
-    pub fn set_gid(&mut self, gid: u32) -> &mut Self {
+    pub const fn set_gid(&mut self, gid: u32) -> &mut Self {
         self.gid = gid;
         self
     }
 
-    pub fn set_uid(&mut self, uid: u32) -> &mut Self {
+    pub const fn set_uid(&mut self, uid: u32) -> &mut Self {
         self.uid = uid;
         self
     }
 
-    pub fn set_parent(&mut self, parent: Ino) -> &mut Self {
+    pub const fn set_parent(&mut self, parent: Ino) -> &mut Self {
         self.parent = parent;
         self
     }
 
-    pub fn set_atime(&mut self, t: SystemTime) -> &mut Self {
+    pub const fn set_atime(&mut self, t: SystemTime) -> &mut Self {
         self.atime = t;
         self
     }
 
-    pub fn set_mtime(&mut self, t: SystemTime) -> &mut Self {
+    pub const fn set_mtime(&mut self, t: SystemTime) -> &mut Self {
         self.mtime = t;
         self
     }
 
-    pub fn set_ctime(&mut self, t: SystemTime) -> &mut Self {
+    pub const fn set_ctime(&mut self, t: SystemTime) -> &mut Self {
         self.ctime = t;
         self
     }
@@ -146,11 +146,11 @@ impl InodeAttr {
 
 // Getter
 impl InodeAttr {
-    pub fn get_filetype(&self) -> FileType { self.kind }
+    pub const fn get_filetype(&self) -> FileType { self.kind }
 
     /// Providing default values guarantees for some critical inode,
     /// makes them always available, even under slow or unreliable conditions.
-    pub fn hard_code_inode_attr(is_trash: bool) -> Self {
+    pub const fn hard_code_inode_attr(is_trash: bool) -> Self {
         Self {
             flags:      0,
             kind:       FileType::Directory,
@@ -169,7 +169,7 @@ impl InodeAttr {
         }
     }
 
-    pub fn empty() -> Self {
+    pub const fn empty() -> Self {
         Self {
             flags:      0,
             kind:       FileType::Directory,
@@ -188,14 +188,14 @@ impl InodeAttr {
         }
     }
 
-    pub fn keep_cache(&mut self) -> &mut Self {
+    pub const fn keep_cache(&mut self) -> &mut Self {
         self.keep_cache = true;
         self
     }
 
     pub fn update_length(&mut self, length: u64) {
         self.length = length;
-        self.update_modification_time()
+        self.update_modification_time();
     }
 
     pub fn update_modification_time(&mut self) {
@@ -203,7 +203,7 @@ impl InodeAttr {
         self.ctime = SystemTime::now();
     }
 
-    pub fn update_modification_time_with(&mut self, time: SystemTime) {
+    pub const fn update_modification_time_with(&mut self, time: SystemTime) {
         self.mtime = time;
         self.ctime = time;
     }
@@ -304,24 +304,24 @@ impl InodeAttr {
 
     pub fn is_file(&self) -> bool { self.kind == FileType::RegularFile }
 
-    pub fn is_immutable(&self) -> bool {
+    pub const fn is_immutable(&self) -> bool {
         let flag = Flags::from_bits_truncate(self.flags as u8);
         flag.contains(Flags::IMMUTABLE)
     }
 
-    pub fn is_append_only(&self) -> bool {
+    pub const fn is_append_only(&self) -> bool {
         let flag = Flags::from_bits_truncate(self.flags as u8);
         flag.contains(Flags::APPEND)
     }
 
-    pub fn is_normal(&self) -> bool {
+    pub const fn is_normal(&self) -> bool {
         let flag = Flags::from_bits_truncate(self.flags as u8);
         let contains = flag.contains(Flags::IMMUTABLE) || flag.contains(Flags::APPEND);
         !contains
     }
 }
 
-fn get_mode_t_from_filetype(kind: &FileType) -> libc::mode_t {
+const fn get_mode_t_from_filetype(kind: &FileType) -> libc::mode_t {
     match kind {
         FileType::Directory => libc::S_IFDIR,
         FileType::RegularFile => libc::S_IFREG,
@@ -333,7 +333,7 @@ fn get_mode_t_from_filetype(kind: &FileType) -> libc::mode_t {
     }
 }
 
-fn make_smode(kind: &FileType, perm: u32) -> u16 {
+const fn make_smode(kind: &FileType, perm: u32) -> u16 {
     // libc::mode_t is u16 on macOS but u32 on Linux; widen both to u32 for the
     // OR, then narrow to the u16 FUSE perm field (valid modes fit in 16 bits).
     let mode = get_mode_t_from_filetype(kind) as u32;
@@ -352,7 +352,7 @@ impl Default for InodeAttr {
             mode:       0,
             nlink:      1,
             length:     0,
-            parent:     Default::default(),
+            parent:     Ino::default(),
             uid:        0,
             gid:        0,
             rdev:       0,
@@ -385,7 +385,6 @@ mod tests {
         let mode = 0o2777u32;
         let mode_u16 = mode as u16;
         assert_eq!(mode_u16, 0o2777u16);
-        // println!("{:?}", mode as u16)
     }
 
     #[test]
@@ -393,10 +392,10 @@ mod tests {
         let mode = get_mode_t_from_filetype(&FileType::Directory);
         let new_mode = mode | 0o777;
         let new_mode_u16 = new_mode as u16;
-        println!("{:?}, {:?}", new_mode, new_mode_u16);
+        println!("{new_mode:?}, {new_mode_u16:?}");
 
         let x = libc::S_ISUID;
         let x2 = 0o1000;
-        println!("{:x}, {:x}", x, x2)
+        println!("{x:x}, {x2:x}");
     }
 }

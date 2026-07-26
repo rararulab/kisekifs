@@ -75,7 +75,7 @@ pub type OverlookedSlicesRef = Arc<OverlookedSlices>;
 pub struct Slices(pub Vec<Slice>);
 
 impl Slices {
-    pub fn decode(buf: &[u8]) -> Result<Slices, Error> {
+    pub fn decode(buf: &[u8]) -> Result<Self, Error> {
         ensure!(
             buf.len().is_multiple_of(SLICE_BYTES),
             InvalidSliceBufSnafu { len: buf.len() }
@@ -87,7 +87,7 @@ impl Slices {
             slices.push(slice);
             i += SLICE_BYTES;
         }
-        Ok(Slices(slices))
+        Ok(Self(slices))
     }
 
     /// Look over all slices and build a RangeMap for them.
@@ -97,14 +97,14 @@ impl Slices {
             rm.insert(
                 s.get_chunk_pos()..s.get_chunk_pos() + s.get_size(),
                 s.clone(),
-            )
+            );
         });
         rm
     }
 
-    pub fn len(&self) -> usize { self.0.len() }
+    pub const fn len(&self) -> usize { self.0.len() }
 
-    pub fn is_empty(&self) -> bool { self.0.is_empty() }
+    pub const fn is_empty(&self) -> bool { self.0.is_empty() }
 }
 
 #[derive(Eq, PartialEq, Clone, Serialize, Deserialize)]
@@ -137,7 +137,7 @@ pub enum Slice {
 impl Debug for Slice {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            Slice::Owned {
+            Self::Owned {
                 chunk_pos,
                 id,
                 size,
@@ -150,7 +150,7 @@ impl Debug for Slice {
                 ReadableSize(*size as u64),
                 _padding
             ),
-            Slice::Borrowed {
+            Self::Borrowed {
                 chunk_pos,
                 id,
                 size,
@@ -170,8 +170,8 @@ impl Debug for Slice {
 }
 
 impl Slice {
-    pub fn new_owned(chunk_pos: usize, slice_id: u64, size: usize) -> Self {
-        Slice::Owned {
+    pub const fn new_owned(chunk_pos: usize, slice_id: u64, size: usize) -> Self {
+        Self::Owned {
             chunk_pos: chunk_pos as u32,
             id:        slice_id,
             size:      size as u32,
@@ -184,45 +184,45 @@ impl Slice {
             buf.len() >= SLICE_BYTES,
             InvalidSliceBufSnafu { len: buf.len() }
         );
-        let x: Slice = bincode::deserialize(buf).context(DecodeSliceBufSnafu)?;
+        let x: Self = bincode::deserialize(buf).context(DecodeSliceBufSnafu)?;
         Ok(x)
     }
 
     pub fn get_chunk_pos(&self) -> usize {
         (match self {
-            Slice::Owned { chunk_pos, .. } => *chunk_pos,
-            Slice::Borrowed { chunk_pos, off, .. } => *chunk_pos + off,
+            Self::Owned { chunk_pos, .. } => *chunk_pos,
+            Self::Borrowed { chunk_pos, off, .. } => *chunk_pos + off,
         }) as usize
     }
 
-    pub fn get_id(&self) -> SliceID {
+    pub const fn get_id(&self) -> SliceID {
         match self {
-            Slice::Owned { id: slice_id, .. } => *slice_id,
-            Slice::Borrowed { id: slice_id, .. } => *slice_id,
+            Self::Owned { id: slice_id, .. } => *slice_id,
+            Self::Borrowed { id: slice_id, .. } => *slice_id,
         }
     }
 
-    pub fn get_size(&self) -> usize {
+    pub const fn get_size(&self) -> usize {
         (match self {
-            Slice::Owned { size, .. } => *size,
+            Self::Owned { size, .. } => *size,
             // for borrowed slice, the size is the length of the borrowed part.
-            Slice::Borrowed { len, .. } => *len,
+            Self::Borrowed { len, .. } => *len,
         }) as usize
     }
 
-    pub fn get_underlying_size(&self) -> usize {
+    pub const fn get_underlying_size(&self) -> usize {
         (match self {
-            Slice::Owned { size, .. } => *size,
-            Slice::Borrowed { size, .. } => *size,
+            Self::Owned { size, .. } => *size,
+            Self::Borrowed { size, .. } => *size,
         }) as usize
     }
 
     /// Return the byte offset where this logical slice starts in its backing
     /// object.
-    pub fn get_underlying_offset(&self) -> usize {
+    pub const fn get_underlying_offset(&self) -> usize {
         match self {
-            Slice::Owned { .. } => 0,
-            Slice::Borrowed { off, .. } => *off as usize,
+            Self::Owned { .. } => 0,
+            Self::Borrowed { off, .. } => *off as usize,
         }
     }
 }
@@ -270,7 +270,7 @@ impl PartialOrd for SliceKey {
 }
 
 impl SliceKey {
-    pub fn new(slice_id: SliceID, block_idx: usize, block_size: usize) -> Self {
+    pub const fn new(slice_id: SliceID, block_idx: usize, block_size: usize) -> Self {
         Self {
             slice_id,
             block_idx,
@@ -278,12 +278,12 @@ impl SliceKey {
         }
     }
 
-    pub fn gen_path_for_local_sto(&self) -> String { format!("{}", self) }
+    pub fn gen_path_for_local_sto(&self) -> String { format!("{self}") }
 
-    pub fn gen_path_for_object_sto(&self) -> String { format!("chunks{}", self) }
+    pub fn gen_path_for_object_sto(&self) -> String { format!("chunks{self}") }
 
     pub fn random() -> Self {
-        SliceKey {
+        Self {
             slice_id:   ID_GENERATOR.next_id().expect("failed to generate id"),
             block_idx:  0,
             block_size: 0,
@@ -304,7 +304,7 @@ impl SliceKey {
 impl TryFrom<&str> for SliceKey {
     type Error = Error;
 
-    fn try_from(s: &str) -> Result<Self, Self::Error> { SliceKey::from_str(s) }
+    fn try_from(s: &str) -> Result<Self, Self::Error> { Self::from_str(s) }
 }
 
 impl FromStr for SliceKey {
@@ -323,7 +323,7 @@ impl FromStr for SliceKey {
         let parse_hex = |field: &str| {
             u64::from_str_radix(field, 16).context(ParseSliceKeyFailedSnafu { str: s.to_string() })
         };
-        let key = SliceKey {
+        let key = Self {
             slice_id:   parse_hex(slice_id)?,
             block_idx:  usize::try_from(parse_hex(block_idx)?)
                 .map_err(|_| InvalidSliceKeyStrSnafu { str: s.to_string() }.build())?,

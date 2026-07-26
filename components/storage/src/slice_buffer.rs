@@ -352,9 +352,9 @@ impl SliceBuffer {
             .count()
     }
 
-    pub fn flushed_length(&self) -> usize { self.flushed_length }
+    pub const fn flushed_length(&self) -> usize { self.flushed_length }
 
-    pub fn length(&self) -> usize { self.length }
+    pub const fn length(&self) -> usize { self.length }
 
     pub fn status(&self) -> SliceBufferStatus {
         let full_cnt = self.full_block_cnt();
@@ -572,7 +572,7 @@ async fn copy_data_block_to_object_storage(
                 .context(UnknownIOSnafu)?,
             Some(page) => {
                 page.copy_to_writer(page_offset, to_flush_len, &mut writer)
-                    .await?
+                    .await?;
             }
         }
         current_flush_data += to_flush_len;
@@ -625,17 +625,17 @@ struct DataBlock {
 }
 
 impl Block {
-    fn new_data_block() -> Block {
-        Block::Data(DataBlock {
+    fn new_data_block() -> Self {
+        Self::Data(DataBlock {
             length: 0,
             pages:  (0..(BLOCK_SIZE / PAGE_SIZE)).map(|_| None).collect(),
         })
     }
 
-    fn is_full(&self) -> bool {
+    const fn is_full(&self) -> bool {
         match self {
-            Block::Empty => false,
-            Block::Data(db) => db.length == BLOCK_SIZE,
+            Self::Empty => false,
+            Self::Data(db) => db.length == BLOCK_SIZE,
         }
     }
 }
