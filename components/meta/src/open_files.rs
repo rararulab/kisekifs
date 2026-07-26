@@ -103,7 +103,7 @@ impl OpenFiles {
         Self {
             ttl,
             _limit: limit,
-            files: Default::default(),
+            files: RwLock::default(),
         }
     }
 
@@ -117,6 +117,10 @@ impl OpenFiles {
 
     /// [`Self::open`] creates a new [OpenFile] if it does not exist; otherwise
     /// it increases the reference count.
+    // The write guard spans a double-checked-lock match with an insert-and-return
+    // arm; the guard already drops before the later `.await`s, and restructuring
+    // the nested match to satisfy the lint would hurt readability.
+    #[allow(clippy::significant_drop_tightening)]
     pub(crate) async fn open(&self, inode: Ino, attr: &mut InodeAttr) {
         let read_guard = self.files.read().await;
         let of = match read_guard.get(&inode) {
@@ -137,7 +141,7 @@ impl OpenFiles {
                                 attr:            attr.keep_cache().clone(),
                                 reference_count: 1,
                                 last_check:      SystemTime::now(),
-                                chunks:          Default::default(),
+                                chunks:          HashMap::default(),
                             }))),
                         );
                         return;

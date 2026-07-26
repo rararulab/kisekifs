@@ -29,7 +29,7 @@ pub fn init_pyroscope() -> Result<Option<Guard>, Whatever> {
     }
 
     let url = url.unwrap();
-    println!("found pyroscope url: {}, starting pyroscope agent ...", url);
+    println!("found pyroscope url: {url}, starting pyroscope agent ...");
 
     let agent = PyroscopeAgent::builder(url, String::from("kiseki"))
         .backend(pprof_backend(PprofConfig::new().sample_rate(100)))

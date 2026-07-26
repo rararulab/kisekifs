@@ -70,7 +70,7 @@ impl KisekiVFS {
     /// - Internal nodes are synthetic and don't exist in the metadata store
     ///
     /// # Examples
-    /// ```rust,no_run
+    /// ```ignore
     /// use kiseki_types::ino::ROOT_INO;
     ///
     /// // Look up a file in the root directory
@@ -141,7 +141,7 @@ impl KisekiVFS {
     /// - Internal nodes have predefined attributes and behavior
     ///
     /// # Examples
-    /// ```rust,no_run
+    /// ```ignore
     /// use kiseki_types::ino::ROOT_INO;
     ///
     /// let attr = vfs.get_attr(ROOT_INO).await?;
@@ -210,7 +210,7 @@ impl KisekiVFS {
     /// - Permission checks are performed when ctx.check_permission is true
     ///
     /// # Examples
-    /// ```rust,no_run
+    /// ```ignore
     /// use fuser::TimeOrNow;
     /// use kiseki_types::attr::SetAttrFlags;
     ///

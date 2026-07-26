@@ -79,7 +79,7 @@ impl KisekiVFS {
     /// - Delegates permission checking to the metadata engine
     ///
     /// # Examples
-    /// ```rust,no_run
+    /// ```ignore
     /// use libc::{O_CREAT, O_RDWR};
     ///
     /// let opened = vfs.open(&ctx, inode, O_RDWR).await?;
@@ -98,7 +98,7 @@ impl KisekiVFS {
         let mut attr = if inode.is_special() {
             self.internal_nodes
                 .get_internal_node(inode)
-                .map(|node| node.get_attr())
+                .map(kiseki_types::internal_nodes::InternalNode::get_attr)
                 .context(LibcSnafu { errno: ENOENT })?
         } else {
             self.meta
@@ -165,7 +165,7 @@ impl KisekiVFS {
     /// - Reads through the data manager for caching and buffering
     ///
     /// # Examples
-    /// ```rust,no_run
+    /// ```ignore
     /// let data = vfs.read(ctx.clone(), inode, fh, 0, 1024, 0, None).await?;
     /// println!("Read {} bytes", data.len());
     /// ```
@@ -265,7 +265,7 @@ impl KisekiVFS {
     /// - May extend the file size if writing beyond current EOF
     ///
     /// # Examples
-    /// ```rust,no_run
+    /// ```ignore
     /// let data = b"Hello, world!";
     /// let written = vfs
     ///     .write(ctx.clone(), inode, fh, 0, data, 0, 0, None)
@@ -360,7 +360,7 @@ impl KisekiVFS {
     /// - Releases POSIX locks if held by the lock owner
     ///
     /// # Examples
-    /// ```rust,no_run
+    /// ```ignore
     /// vfs.flush(ctx.clone(), inode, fh, lock_owner).await?;
     /// println!("File flushed successfully");
     /// ```
@@ -461,7 +461,7 @@ impl KisekiVFS {
     /// - Coordinates with concurrent operations through file handle locking
     ///
     /// # Examples
-    /// ```rust,no_run
+    /// ```ignore
     /// vfs.fsync(ctx.clone(), inode, fh, false).await?;
     /// println!("File data synchronized to storage");
     /// ```

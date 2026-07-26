@@ -70,13 +70,13 @@ pub fn open(config: MetaConfig) -> Result<MetaEngineRef> {
         root: ROOT_INO,
         session_id: 0,
         open_files,
-        symlinks: Default::default(),
-        removed_files: Default::default(),
+        symlinks: RwLock::default(),
+        removed_files: RwLock::default(),
         // Limit the number of incoming requests being handled at the same time
         delete_semaphore: Arc::new(Semaphore::const_new(100)),
-        dir_parents: Default::default(),
-        fs_stat_used_size: Default::default(),
-        fs_stat_file_count: Default::default(),
+        dir_parents: RwLock::default(),
+        fs_stat_used_size: AtomicU64::default(),
+        fs_stat_file_count: AtomicU64::default(),
         free_inodes: IdTable::new(backend.clone(), Counter::NextInode),
         free_slices: IdTable::new(backend.clone(), Counter::NextSlice),
         backend,
@@ -192,7 +192,7 @@ impl MetaEngine {
 }
 
 impl MetaEngine {
-    pub fn get_format(&self) -> &Format { &self.format }
+    pub const fn get_format(&self) -> &Format { &self.format }
 
     #[instrument(skip(self))]
     pub async fn next_slice_id(&self) -> Result<SliceID> { self.free_slices.next().await }
@@ -746,12 +746,11 @@ impl MetaEngine {
 
         ctx.check_access(&attr, mask)?;
 
-        let attr_flags = match u8::try_from(attr.flags)
+        let Some(attr_flags) = u8::try_from(attr.flags)
             .ok()
             .and_then(kiseki_types::attr::Flags::from_bits)
-        {
-            Some(flags) => flags,
-            None => return LibcSnafu { errno: libc::EIO }.fail(),
+        else {
+            return LibcSnafu { errno: libc::EIO }.fail();
         };
         if (attr_flags.contains(kiseki_types::attr::Flags::IMMUTABLE))
             && flags & (libc::O_WRONLY | libc::O_RDWR) != 0
@@ -770,7 +769,7 @@ impl MetaEngine {
         Ok(attr)
     }
 
-    fn refresh_atime(&self, _ctx: &FuseContext, _inode: Ino) {}
+    const fn refresh_atime(&self, _ctx: &FuseContext, _inode: Ino) {}
 
     // Write put a slice of data on top of the given chunk.
     #[instrument(skip(self, mtime), fields(inode = ? inode, chunk_idx = ? chunk_idx, chunk_pos = ? chunk_pos, slice = ? slice))]
@@ -1026,8 +1025,7 @@ impl MetaEngine {
         }
         drop(read_guard);
         let t = self.backend.do_readlink(inode)?;
-        let mut write_guard = self.symlinks.write().await;
-        write_guard.insert(inode, t.clone());
+        self.symlinks.write().await.insert(inode, t.clone());
         Ok(t)
     }
 }
@@ -1301,7 +1299,7 @@ mod format_tests {
             name: "replacement-volume".to_string(),
             max_capacity: Some(2048),
             max_inodes: Some(256),
-            ..initial.clone()
+            ..initial
         };
         let result = update_format(&dsn, requested, false);
 
@@ -1332,7 +1330,7 @@ mod format_tests {
             name: "renamed-volume".to_string(),
             max_capacity: Some(2048),
             max_inodes: None,
-            ..initial.clone()
+            ..initial
         };
         update_format(&dsn, requested.clone(), true).expect("force mutable update");
 
@@ -1359,7 +1357,7 @@ mod format_tests {
         let requested = Format {
             name: "renamed-volume".to_string(),
             block_size: initial.block_size * 2,
-            ..initial.clone()
+            ..initial
         };
         let result = update_format(&dsn, requested, true);
 

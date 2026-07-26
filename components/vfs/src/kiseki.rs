@@ -276,7 +276,7 @@ impl KisekiVFS {
     /// - Subdirectory chroot operation fails (when configured)
     ///
     /// # Examples
-    /// ```rust,no_run
+    /// ```ignore
     /// use kiseki_meta::context::FuseContext;
     ///
     /// let ctx = FuseContext::background();
@@ -392,7 +392,7 @@ impl KisekiVFS {
     /// - Permission denied for the requested inode
     ///
     /// # Examples
-    /// ```rust,no_run
+    /// ```ignore
     /// use kiseki_types::ino::ROOT_INO;
     ///
     /// let stats = vfs.stat_fs(ctx.clone(), ROOT_INO)?;

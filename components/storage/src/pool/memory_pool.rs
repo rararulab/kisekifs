@@ -59,7 +59,7 @@ impl MemoryPagePool {
             page_size,
             capacity,
             queue: ArrayQueue::new(page_cnt),
-            notify: Default::default(),
+            notify: Notify::default(),
         });
 
         for _ in 0..page_cnt {
@@ -105,11 +105,11 @@ impl MemoryPagePool {
     pub fn remain_page_cnt(&self) -> usize { self.queue.len() }
 
     #[inline]
-    pub fn total_page_cnt(&self) -> usize { self.capacity / self.page_size }
+    pub const fn total_page_cnt(&self) -> usize { self.capacity / self.page_size }
 
     #[allow(dead_code)] // only exercised by tests so far
     #[inline]
-    pub fn capacity(&self) -> usize { self.capacity }
+    pub const fn capacity(&self) -> usize { self.capacity }
 }
 
 impl Display for MemoryPagePool {

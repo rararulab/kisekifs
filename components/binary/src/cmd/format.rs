@@ -90,7 +90,9 @@ pub struct FormatArgs {
 impl FormatArgs {
     fn generate_format(&self) -> Format {
         let mut format = Format {
-            max_capacity: self.capacity.map(|s| s.as_bytes_usize()),
+            max_capacity: self
+                .capacity
+                .map(kiseki_utils::readable_size::ReadableSize::as_bytes_usize),
             block_size: self.block_size.as_bytes_usize(),
             name: self.name.clone(),
             ..Default::default()
@@ -122,36 +124,36 @@ static NAME_REGEX: LazyLock<Result<Regex, regex::Error>> =
 // Validation function for file system names
 fn validate_name(name: &str) -> Result<String, String> {
     if name.len() <= 3 {
-        return Err(format!("File system name {:?} is too short", name));
+        return Err(format!("File system name {name:?} is too short"));
     }
     if name.len() >= 30 {
-        return Err(format!("File system name {:?} is too long", name));
+        return Err(format!("File system name {name:?} is too long"));
     }
     let reg = NAME_REGEX
         .as_ref()
         .map_err(|error| format!("invalid built-in name pattern: {error}"))?;
     if !reg.is_match(name) {
-        return Err(format!("File system name {:?} is invalid", name));
+        return Err(format!("File system name {name:?} is invalid"));
     }
 
     Ok(name.to_string())
 }
 
 fn validate_block_size(s: &str) -> Result<ReadableSize, String> {
-    let n = ReadableSize::from_str(s).map_err(|e| format!("invalid block size: {}", e))?;
+    let n = ReadableSize::from_str(s).map_err(|e| format!("invalid block size: {e}"))?;
     let n = n.as_bytes() as usize;
     let n = align_to_block(n);
     if n < kiseki_common::MIN_BLOCK_SIZE {
-        return Err(format!("block size {} too small", n));
+        return Err(format!("block size {n} too small"));
     }
     if n > kiseki_common::MAX_BLOCK_SIZE {
-        return Err(format!("block size {} too large", n));
+        return Err(format!("block size {n} too large"));
     }
     Ok(ReadableSize(n as u64))
 }
 
 fn validate_capacity(s: &str) -> Result<ReadableSize, String> {
-    let n = ReadableSize::from_str(s).map_err(|e| format!("invalid capacity: {}", e))?;
+    let n = ReadableSize::from_str(s).map_err(|e| format!("invalid capacity: {e}"))?;
     let n = n.as_bytes() as usize;
 
     Ok(ReadableSize(align4k(n as u64) as u64))

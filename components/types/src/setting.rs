@@ -78,7 +78,7 @@ pub struct Format {
 
 impl Default for Format {
     fn default() -> Self {
-        Format {
+        Self {
             name:         String::from(KISEKI),
             chunk_size:   CHUNK_SIZE, // 64MB
             block_size:   BLOCK_SIZE, // 4MB

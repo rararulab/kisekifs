@@ -88,7 +88,7 @@ impl DataManager {
                     fw:       fw_cloned,
                     flush_rx: rx,
                 };
-                flusher.run().await
+                flusher.run().await;
             });
             fw
         });
@@ -109,10 +109,13 @@ impl DataManager {
         data: &[u8],
     ) -> Result<usize> {
         debug!("write {} bytes to ino {}", data.len(), ino);
+        // Clone the `Arc<FileWriter>` out so the DashMap shard lock is released
+        // before the (awaiting) write, rather than held across it.
         let fw = self
             .file_writers
             .get(&ino)
-            .context(LibcSnafu { errno: EBADF })?;
+            .context(LibcSnafu { errno: EBADF })?
+            .clone();
         debug!("Ino({ino}) get file write success");
         let write_len = fw.write(offset, data).await?;
         let current_len = fw.get_length();
@@ -242,7 +245,10 @@ impl FileWriter {
     /// [FileWriter::finish] call.
     fn record_flush_error(&self, err: Error) {
         error!("Ino({}) background flush failed: {}", self.inode, err);
-        let mut guard = self.flush_error.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self
+            .flush_error
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if guard.is_none() {
             *guard = Some(err);
         }
@@ -252,21 +258,21 @@ impl FileWriter {
     fn take_flush_error(&self) -> Option<Error> {
         self.flush_error
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take()
     }
 
     fn has_flush_error(&self) -> bool {
         self.flush_error
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .is_some()
     }
 
     fn record_published_slice(&self, slice_id: SliceID) {
         self.published_slices
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(slice_id);
     }
 
@@ -469,8 +475,7 @@ impl FileWriter {
             return Err(e);
         }
 
-        let mut write_guard = self.chunk_writers.write().await;
-        write_guard.clear();
+        self.chunk_writers.write().await.clear();
         Ok(())
     }
 
@@ -478,7 +483,7 @@ impl FileWriter {
         let slice_ids = self
             .published_slices
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
             .copied()
             .collect::<Vec<_>>();
@@ -492,7 +497,7 @@ impl FileWriter {
             file_cache.flush_slice(slice_id).await?;
             self.published_slices
                 .lock()
-                .unwrap_or_else(|e| e.into_inner())
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .remove(&slice_id);
         }
         Ok(())
@@ -626,7 +631,10 @@ impl ChunkWriter {
         self: &Arc<Self>,
         l: &ChunkWriteCtx,
     ) -> (Arc<SliceWriter>, SliceWriterState) {
-        let fw = self.fw.upgrade().unwrap();
+        let fw = self
+            .fw
+            .upgrade()
+            .expect("file writer dropped while chunk writer is active");
         {
             let read_guard = self.slice_writers.read().await;
             for (idx, (_, sw)) in read_guard.iter().rev().enumerate() {
@@ -687,8 +695,10 @@ impl ChunkWriter {
             fw.data_manager.clone(),
         ));
         self.total_slice_count.fetch_add(1, Ordering::AcqRel);
-        let mut write_guard = self.slice_writers.write().await;
-        write_guard.insert(sw._internal_seq, sw.clone());
+        self.slice_writers
+            .write()
+            .await
+            .insert(sw._internal_seq, sw.clone());
         (sw, SliceWriterState::Idle)
     }
 
@@ -780,12 +790,12 @@ enum SliceWriterState {
 impl From<u8> for SliceWriterState {
     fn from(value: u8) -> Self {
         match value {
-            0 => SliceWriterState::Idle,
-            1 => SliceWriterState::Writing,
-            2 => SliceWriterState::Dirty,
-            3 => SliceWriterState::Flushing,
-            4 => SliceWriterState::Committing,
-            5 => SliceWriterState::Done,
+            0 => Self::Idle,
+            1 => Self::Writing,
+            2 => Self::Dirty,
+            3 => Self::Flushing,
+            4 => Self::Committing,
+            5 => Self::Done,
             // Invariant: the backing AtomicU8 is only ever stored/CASed with
             // `SliceWriterState as u8` values in this file, so this arm is
             // unreachable. Returning a made-up state here instead would
@@ -837,7 +847,7 @@ impl SliceWriter {
         seq: u64,
         offset_of_chunk: usize,
         data_manager: Weak<DataManager>,
-    ) -> SliceWriter {
+    ) -> Self {
         Self {
             chunk_index,
             chunk_writer: Arc::downgrade(cw),
@@ -858,8 +868,12 @@ impl SliceWriter {
         offset: usize,
         data: &[u8],
     ) -> Result<usize> {
-        let mut write_guard = self.slice_buffer.write().await;
-        let written = write_guard.write_at(offset, data).await?;
+        let written = self
+            .slice_buffer
+            .write()
+            .await
+            .write_at(offset, data)
+            .await?;
         self.last_modified.store(Instant::now());
         let new_state = if written == 0 {
             before_state
@@ -897,7 +911,11 @@ impl SliceWriter {
             .stage(
                 slice_id,
                 offset,
-                self.data_manager.upgrade().unwrap().file_cache.clone(),
+                self.data_manager
+                    .upgrade()
+                    .expect("data manager dropped during slice flush")
+                    .file_cache
+                    .clone(),
             )
             .await?;
         drop(write_guard);
@@ -969,7 +987,11 @@ impl SliceWriter {
         write_guard
             .flush_v2(
                 slice_id,
-                self.data_manager.upgrade().unwrap().file_cache.clone(),
+                self.data_manager
+                    .upgrade()
+                    .expect("data manager dropped during slice flush")
+                    .file_cache
+                    .clone(),
             )
             .await?;
 
@@ -1145,6 +1167,9 @@ impl SliceWriter {
     }
 
     // get the underlying write buffer's released length and total write length.
+    // The whole body is the critical section (two reads under one guard), so
+    // there is nothing to tighten.
+    #[allow(clippy::significant_drop_tightening)]
     async fn get_flushed_length_and_total_write_length(self: &Arc<Self>) -> (usize, usize) {
         let guard = self.slice_buffer.read().await;
         let flushed_len = guard.flushed_length();
@@ -1157,7 +1182,10 @@ impl SliceWriter {
         inode: Ino,
         meta_engine_ref: MetaEngineRef,
     ) -> Result<()> {
-        let cw = self.chunk_writer.upgrade().unwrap();
+        let cw = self
+            .chunk_writer
+            .upgrade()
+            .expect("chunk writer dropped while committing partial slice");
 
         // write slice meta info to meta engine.
         let slice_id = self.slice_id.load(Ordering::Acquire);

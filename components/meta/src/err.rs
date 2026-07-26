@@ -94,8 +94,8 @@ pub enum Error {
 }
 
 impl Error {
-    pub fn is_not_found(&self) -> bool {
-        matches!(self, Error::ModelError { source, .. } if source.is_not_found())
+    pub const fn is_not_found(&self) -> bool {
+        matches!(self, Self::ModelError { source, .. } if source.is_not_found())
     }
 }
 
@@ -136,30 +136,30 @@ pub mod model_err {
     }
 
     impl Error {
-        pub fn is_not_found(&self) -> bool { matches!(self, Error::NotFound { .. }) }
+        pub const fn is_not_found(&self) -> bool { matches!(self, Self::NotFound { .. }) }
     }
 }
 
 impl ToErrno for Error {
     fn to_errno(&self) -> libc::c_int {
         match self {
-            Error::Unknown { .. } => libc::EINTR,
-            Error::UnsupportedMetaDSN { .. } => libc::EINTR,
-            Error::TokioJoinError { .. } => libc::EINTR,
+            Self::Unknown { .. } => libc::EINTR,
+            Self::UnsupportedMetaDSN { .. } => libc::EINTR,
+            Self::TokioJoinError { .. } => libc::EINTR,
             #[cfg(feature = "meta-rocksdb")]
-            Error::RocksdbError { .. } => libc::EINTR,
-            Error::ModelError { source, .. } => {
+            Self::RocksdbError { .. } => libc::EINTR,
+            Self::ModelError { source, .. } => {
                 if source.is_not_found() {
                     libc::ENOENT
                 } else {
                     libc::EINTR
                 }
             }
-            Error::UninitializedEngine { .. } => libc::EINTR,
-            Error::AlreadyInitialized { .. } => libc::EEXIST,
-            Error::IncompatibleFormat { .. } => libc::EINVAL,
-            Error::InvalidSetting { .. } => libc::EINTR,
-            Error::LibcError { errno, .. } => *errno,
+            Self::UninitializedEngine { .. } => libc::EINTR,
+            Self::AlreadyInitialized { .. } => libc::EEXIST,
+            Self::IncompatibleFormat { .. } => libc::EINVAL,
+            Self::InvalidSetting { .. } => libc::EINTR,
+            Self::LibcError { errno, .. } => *errno,
         }
     }
 }

@@ -65,17 +65,17 @@ pub struct PagePoolBuilder {
 }
 
 impl PagePoolBuilder {
-    pub fn with_page_size(mut self, page_size: usize) -> Self {
+    pub const fn with_page_size(mut self, page_size: usize) -> Self {
         self.page_size = page_size;
         self
     }
 
-    pub fn with_memory_capacity(mut self, memory_capacity: usize) -> Self {
+    pub const fn with_memory_capacity(mut self, memory_capacity: usize) -> Self {
         self.memory_capacity = memory_capacity;
         self
     }
 
-    pub fn with_disk_capacity(mut self, disk_capacity: usize) -> Self {
+    pub const fn with_disk_capacity(mut self, disk_capacity: usize) -> Self {
         self.disk_capacity = Some(disk_capacity);
         self
     }
@@ -202,10 +202,10 @@ impl HybridPagePool {
     }
 
     #[allow(dead_code)] // only exercised by tests so far
-    pub fn total_page_cnt(&self) -> usize { self.total_page_cnt }
+    pub const fn total_page_cnt(&self) -> usize { self.total_page_cnt }
 
     #[allow(dead_code)] // only exercised by tests so far
-    pub fn capacity(&self) -> usize { self.memory_capacity + self.disk_capacity }
+    pub const fn capacity(&self) -> usize { self.memory_capacity + self.disk_capacity }
 
     pub fn free_ratio(&self) -> f64 { self.remain() as f64 / self.total_page_cnt as f64 }
 }
@@ -226,8 +226,8 @@ impl Page {
         W: tokio::io::AsyncWrite + Unpin + ?Sized,
     {
         match self {
-            Page::Memory(page) => page.copy_to_writer(offset, length, writer).await,
-            Page::Disk(page) => page.copy_to_writer(offset, length, writer).await,
+            Self::Memory(page) => page.copy_to_writer(offset, length, writer).await,
+            Self::Disk(page) => page.copy_to_writer(offset, length, writer).await,
         }
     }
 
@@ -241,8 +241,8 @@ impl Page {
         R: tokio::io::AsyncRead + Unpin + ?Sized,
     {
         match self {
-            Page::Memory(page) => page.copy_from_reader(offset, length, reader).await,
-            Page::Disk(page) => page.copy_from_reader(offset, length, reader).await,
+            Self::Memory(page) => page.copy_from_reader(offset, length, reader).await,
+            Self::Disk(page) => page.copy_from_reader(offset, length, reader).await,
         }
     }
 }
@@ -320,7 +320,7 @@ mod tests {
                 let pool = pool.clone();
                 tokio::spawn(async move {
                     let mut page = pool.acquire_page().await;
-                    let mut data = Vec::from(format!("hello {}", i));
+                    let mut data = Vec::from(format!("hello {i}"));
                     let data_len = data.len();
                     let mut cursor = Cursor::new(&mut data);
                     page.copy_from_reader(0, data_len, &mut cursor)

@@ -47,9 +47,9 @@ pub const MIN_FILE_SYSTEM_CAPACITY: usize = 1 << 30; // 1 GiB
 
 pub const MAX_SYMLINK_LEN: usize = 4096;
 
-pub fn cal_chunk_idx(offset: usize, chunk_size: usize) -> usize { offset / chunk_size }
+pub const fn cal_chunk_idx(offset: usize, chunk_size: usize) -> usize { offset / chunk_size }
 
-pub fn cal_chunk_offset(offset: usize, chunk_size: usize) -> usize { offset % chunk_size }
+pub const fn cal_chunk_offset(offset: usize, chunk_size: usize) -> usize { offset % chunk_size }
 
 pub type PageSize = usize;
 pub type BlockIndex = usize;

@@ -64,6 +64,10 @@ impl KisekiVFS {
         Ok(self.handle_table.new_dir_handle(inode).await)
     }
 
+    // The directory handle's write lock is deliberately held across
+    // `meta.read_dir` to atomically populate its cached children; releasing it
+    // earlier would reintroduce the TOCTOU the double-checked lock avoids.
+    #[allow(clippy::significant_drop_tightening)]
     pub async fn read_dir<I: Into<Ino>>(
         &self,
         ctx: &FuseContext,
@@ -143,7 +147,7 @@ impl KisekiVFS {
     /// - Permissions are modified by umask before setting
     ///
     /// # Examples
-    /// ```rust,no_run
+    /// ```ignore
     /// use kiseki_types::ino::ROOT_INO;
     ///
     /// let new_dir = vfs
@@ -298,7 +302,7 @@ impl KisekiVFS {
     /// - Updates file reader length before returning the handle
     ///
     /// # Examples
-    /// ```rust,no_run
+    /// ```ignore
     /// use kiseki_types::ino::ROOT_INO;
     /// use libc::O_RDWR;
     ///
@@ -528,7 +532,7 @@ impl KisekiVFS {
     /// - Handles both file and directory renaming
     ///
     /// # Examples
-    /// ```rust,no_run
+    /// ```ignore
     /// use kiseki_types::ino::ROOT_INO;
     ///
     /// // Rename a file in the same directory

@@ -49,7 +49,7 @@ impl Debug for FSStat {
 
 impl Default for FSStat {
     fn default() -> Self {
-        FSStat {
+        Self {
             total_size: u64::MAX,
             used_size:  0,
             file_count: 0,

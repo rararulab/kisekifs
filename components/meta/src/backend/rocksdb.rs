@@ -195,7 +195,7 @@ impl Builder {
         self
     }
 
-    pub fn with_skip_dir_mtime(&mut self, d: Duration) -> &mut Self {
+    pub const fn with_skip_dir_mtime(&mut self, d: Duration) -> &mut Self {
         self.skip_dir_mtime = d;
         self
     }
@@ -935,7 +935,7 @@ impl Backend for RocksdbBackend {
             })
             .context(ModelSnafu)?;
         debug!("get_chunk_slices: key: {:?}", String::from_utf8_lossy(&key));
-        for slice in slices.0.iter() {
+        for slice in &slices.0 {
             debug!("get_chunk_slices: slice: {:?}", slice);
         }
         Ok(slices)
@@ -2119,7 +2119,7 @@ mod tests {
     fn test_backend_creation(test_backend: (RocksdbBackend, TempDir)) {
         let (backend, _tempdir) = test_backend;
         // Backend should be created successfully
-        assert!(format!("{:?}", backend).contains("RocksdbEngine"));
+        assert!(format!("{backend:?}").contains("RocksdbEngine"));
     }
 
     #[rstest]

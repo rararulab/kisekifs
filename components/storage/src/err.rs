@@ -97,8 +97,8 @@ pub enum Error {
 }
 
 impl Error {
-    pub fn is_not_found(&self) -> bool {
-        matches!(self, Error::ObjectStorageError { source, .. } if kiseki_utils::object_storage::is_not_found_error(source))
+    pub const fn is_not_found(&self) -> bool {
+        matches!(self, Self::ObjectStorageError { source, .. } if kiseki_utils::object_storage::is_not_found_error(source))
     }
 }
 

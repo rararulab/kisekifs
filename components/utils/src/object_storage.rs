@@ -139,7 +139,7 @@ impl ObjectStorageConfig {
         }
     }
 
-    pub fn provider(&self) -> &'static str {
+    pub const fn provider(&self) -> &'static str {
         match self {
             Self::Memory => "memory",
             Self::File { .. } => "file",
@@ -373,7 +373,7 @@ async fn probe_list(
     Ok(())
 }
 
-pub fn is_not_found_error(e: &ObjectStorageError) -> bool {
+pub const fn is_not_found_error(e: &ObjectStorageError) -> bool {
     matches!(e, ObjectStorageError::NotFound { .. })
 }
 
