@@ -72,3 +72,38 @@ serial_test = "3.5"
 [profile.release]
 debug = true
 panic = 'abort'
+
+# Centralized lint policy. Crates opt in with `[lints] workspace = true`.
+# Curated-pragmatic: today's `clippy::all` gate plus a hand-picked set of
+# high-value pedantic/nursery lints; noisy or low-value lints are allowed.
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+# High-value pedantic/nursery lints (CI's `-D warnings` makes these hard errors).
+use_self = "warn"
+uninlined_format_args = "warn"
+semicolon_if_nothing_returned = "warn"
+redundant_clone = "warn"
+explicit_iter_loop = "warn"
+manual_let_else = "warn"
+map_unwrap_or = "warn"
+inefficient_to_string = "warn"
+redundant_closure_for_method_calls = "warn"
+significant_drop_tightening = "warn"
+missing_const_for_fn = "warn"
+# Noisy / low-value in this codebase -> allow.
+cast_possible_truncation = "allow"
+cast_precision_loss = "allow"
+cast_sign_loss = "allow"
+cast_possible_wrap = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+# Pedantic, not auto-fixable, and low-value in struct literals where the field
+# type is already obvious -> allow rather than churn every `Default::default()`.
+default_trait_access = "allow"
+module_name_repetitions = "allow"
+doc_markdown = "allow"
+too_many_lines = "allow"
