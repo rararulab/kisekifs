@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en" id="oranda" class="axo">
+  <head>
+    <title>My Oranda Project</title>
+    
+    
+      <link rel="icon" href="/kisekifs/favicon.ico" />
+    
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content="My Oranda Project" />
+    
+    
+    
+    <meta http-equiv="Permissions-Policy" content="interest-cohort=()" />
+    <link rel="stylesheet" href="/kisekifs/oranda-v0.6.1.css" />
+    
+    
+  </head>
+  <body>
+    <div class="container">
+      <div class="page-body">
+        
+
+        <main>
+          <header>
+            
+            <h1 class="title">My Oranda Project</h1>
+            
+  <nav class="nav">
+    <ul>
+      <li><a href="/kisekifs/">Home</a></li>
+
+      
+
+      
+        <li><a href="/kisekifs/artifacts/">Install</a></li>
+      
+
+      
+        <li><a href="/kisekifs/book/">Docs</a></li>
+      
+
+      
+
+      
+    </ul>
+  </nav>
+
+          </header>
+
+          
+
+
+    <h1>Kiseki</h1>
+<p>Go check the <a href="https://crrow.github.io/kisekifs/" rel="noopener noreferrer">doc</a>.</p>
+<p>Kiseki is a distributed FUSE filesystem, originally a port of
+<a href="https://github.com/juicedata/juicefs" rel="noopener noreferrer">JuiceFS</a>, now being built toward a
+<strong>production-usable, performance-oriented</strong> product. It separates data
+(object storage such as S3) from metadata (RocksDB today, a shared/network
+backend planned for multi-node).</p>
+<blockquote>
+<p><strong>Status:</strong> the project has moved beyond its original "learning project"
+phase and is being hardened for production. Expect breaking changes while core
+gaps (read-path caching, distributed metadata, FUSE layer) are addressed.</p>
+</blockquote>
+<p>If you don't know juicefs very much, the following is the introduction of juicefs:</p>
+<pre style="background-color:#263238;"><span style="color:#eeffff;">JuiceFS is an open-source, high-performance distributed file system designed for the cloud. By providing full POSIX
+</span><span style="color:#eeffff;">compatibility, it allows almost all kinds of object storage to be used as massive
+</span><span style="color:#eeffff;">local disks and to be mounted and accessed on different hosts across platforms and regions.
+</span><span style="color:#eeffff;">
+</span><span style="color:#eeffff;">JuiceFS separates "data" and "metadata" storage. Files are split into chunks and stored in object storage like Amazon
+</span><span style="color:#eeffff;">S3. The corresponding metadata can be stored in various databases such as Redis, MySQL, TiKV, and SQLite, based on the
+</span><span style="color:#eeffff;">scenarios and requirements.
+</span></pre>
+
+<p>FUSE must be installed to build or run programs that use fuser (i.e. kernel driver and libraries. Some platforms may
+also require userland utils like <code>fusermount</code>). A default installation of FUSE is usually sufficient.</p>
+<p>To build fuser or any program that depends on it, <code>pkg-config</code> needs to be installed as well.</p>
+<h2>Difference with juicefs</h2>
+<h3>1. Write Buffer</h3>
+<p>JuiceFS uses a pre-allocated memory and growable bytes pool as write buffer,
+but this pool is also used for make reading buffer.</p>
+<p>Kiseki's write buffer pool is fixed-size, and it is consist of a in-memory bytes
+pool and a mmap file.</p>
+<h3>2. Cache</h3>
+<p>JuiceFs use disk-eviction mechinism to manage the writeback cache,
+in Kisekifs, it employs <a href="https://github.com/moka-rs/moka" rel="noopener noreferrer">moka</a> to implement the
+write back cache, much cleaner and efficient.</p>
+<h3>3. How to read slices</h3>
+<p>JuiceFs reorganize the slices into a linkedlist, kisekifs use <a href="https://github.com/jeffparsons/rangemap" rel="noopener noreferrer">rangemap</a> to
+handle the trick part.</p>
+<h1>Filesystem semantics</h1>
+<p>KisekiFS does not claim full POSIX compliance. Its versioned, Linux-only
+supported and intentionally unsupported behavior is listed in the
+<a href="./docs/src/posix-support.md" rel="noopener noreferrer">filesystem support matrix</a>.</p>
+<h2>Disclaimer</h2>
+<p>Kiseki is an independent project
+and is not endorsed by or affiliated with the Juice company.</p>
+<h1>License</h1>
+<p>Apache-2.0</p>
+
+
+
+        </main>
+      </div>
+
+      <footer>
+        
+        <span>
+          My Oranda Project
+        </span>
+      </footer>
+    </div>
+
+    
+    
+
+    
+
+
+  </body>
+</html>

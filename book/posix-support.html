@@ -1,0 +1,271 @@
+<!DOCTYPE HTML>
+<html lang="en" class="sidebar-visible no-js oranda-light">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Linux filesystem support - Kiseki</title>
+
+
+        <!-- Custom HTML head -->
+        
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff" />
+
+        <link rel="icon" href="favicon.svg">
+        <link rel="shortcut icon" href="favicon.png">
+        <link rel="stylesheet" href="css/variables.css">
+        <link rel="stylesheet" href="css/general.css">
+        <link rel="stylesheet" href="css/chrome.css">
+        <link rel="stylesheet" href="css/print.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="FontAwesome/css/font-awesome.css">
+        <link rel="stylesheet" href="fonts/fonts.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" href="highlight.css">
+        <link rel="stylesheet" href="tomorrow-night.css">
+        <link rel="stylesheet" href="ayu-highlight.css">
+        <link rel="stylesheet" href="oranda-highlight.css">
+
+        <!-- Custom theme stylesheets -->
+
+    </head>
+    <body>
+    <div id="body-container">
+        <!-- Provide site root to javascript -->
+        <script>
+            var path_to_root = "";
+            var default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? "oranda-light" : "oranda-light";
+        </script>
+
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                var theme = localStorage.getItem('orandamdbook-theme');
+                var sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('orandamdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            var theme;
+            try { theme = localStorage.getItem('orandamdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            var html = document.querySelector('html');
+            html.classList.remove('no-js')
+            html.classList.remove('oranda-light')
+            html.classList.add(theme);
+            html.classList.add('js');
+        </script>
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            var html = document.querySelector('html');
+            var sidebar = 'hidden';
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            }
+            html.classList.remove('sidebar-visible');
+            html.classList.add("sidebar-" + sidebar);
+        </script>
+
+        <nav id="sidebar" class="sidebar" aria-label="Table of contents">
+            <div class="sidebar-scrollbox">
+                <ol class="chapter"><li class="chapter-item expanded "><a href="quick_start.html"><strong aria-hidden="true">1.</strong> QuickStart</a></li><li class="chapter-item expanded "><a href="direction.html"><strong aria-hidden="true">2.</strong> Project Direction</a></li><li class="chapter-item expanded "><a href="design.html"><strong aria-hidden="true">3.</strong> Design</a></li><li class="chapter-item expanded "><a href="bench.html"><strong aria-hidden="true">4.</strong> Bench</a></li><li class="chapter-item expanded "><a href="posix-support.html" class="active"><strong aria-hidden="true">5.</strong> Linux filesystem support</a></li><li class="chapter-item expanded "><a href="operator-runbook.html"><strong aria-hidden="true">6.</strong> Mount operations runbook</a></li><li class="chapter-item expanded "><a href="background.html"><strong aria-hidden="true">7.</strong> Background</a></li></ol>
+            </div>
+            <div id="sidebar-resize-handle" class="sidebar-resize-handle"></div>
+        </nav>
+
+        <div id="page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                                <div id="menu-bar-hover-placeholder"></div>
+                <div id="menu-bar" class="menu-bar sticky bordered">
+                    <div class="left-buttons">
+                        <button id="sidebar-toggle" class="icon-button" type="button" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="sidebar">
+                            <i class="fa fa-bars"></i>
+                        </button>
+                        <button id="theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="theme-list">
+                            <i class="fa fa-paint-brush"></i>
+                        </button>
+                        <ul id="theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="ayu">Ayu</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="oranda-light">Axo Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="oranda-dark">Axo Dark</button></li>
+
+                        </ul>
+                        <button id="search-toggle" class="icon-button" type="button" title="Search. (Shortkey: s)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="S" aria-controls="searchbar">
+                            <i class="fa fa-search"></i>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">Kiseki</h1>
+
+                    <div class="right-buttons">
+                        <a href="print.html" title="Print this book" aria-label="Print this book">
+                            <i id="print-button" class="fa fa-print"></i>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="search-wrapper" class="hidden">
+                    <form id="searchbar-outer" class="searchbar-outer">
+                        <input type="search" id="searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="searchresults-outer" aria-describedby="searchresults-header">
+                    </form>
+                    <div id="searchresults-outer" class="searchresults-outer hidden">
+                        <div id="searchresults-header" class="searchresults-header"></div>
+                        <ul id="searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="content" class="content">
+                    <main>
+                        <h1 id="linux-filesystem-support-contract"><a class="header" href="#linux-filesystem-support-contract">Linux filesystem support contract</a></h1>
+<p>This document defines KisekiFS support manifest version 1. It is deliberately a
+bounded Linux contract, not a claim of full POSIX compliance. A behavior is
+<strong>supported</strong> only when the real binary is exercised through the Linux kernel
+and <code>/dev/fuse</code> by the required mounted test named in the table. <strong>Unsupported</strong>
+means the kernel-visible errno is intentional and stable. <strong>Experimental</strong>
+means the implementation exists but is not a release promise.</p>
+<p>The machine-readable source of case IDs and statuses is
+<code>tests/fixtures/posix-support.toml</code>; a unit test rejects duplicate IDs, invalid
+statuses, documentation drift, and supported entries without a registered
+mounted test.</p>
+<h2 id="supported-operations"><a class="header" href="#supported-operations">Supported operations</a></h2>
+<div class="table-wrapper"><table><thead><tr><th>Case ID</th><th>Operations and promise</th><th>Mounted test</th></tr></thead><tbody>
+<tr><td><code>mount.smoke</code></td><td>Mount, create, open, write, close, and clean unmount</td><td><code>mounted::smoke::mount_create_unmount</code></td></tr>
+<tr><td><code>namespace.create-remove</code></td><td>Regular-file and directory creation/removal</td><td><code>mounted::semantics::namespace_and_metadata</code></td></tr>
+<tr><td><code>namespace.rename</code></td><td>Rename within and across directories</td><td><code>mounted::semantics::namespace_and_metadata</code></td></tr>
+<tr><td><code>namespace.links</code></td><td>Hard links, symbolic links, and <code>readlink</code></td><td><code>mounted::semantics::namespace_and_metadata</code></td></tr>
+<tr><td><code>directory.enumeration</code></td><td><code>opendir</code>, <code>readdir</code>, and <code>releasedir</code>; visible names are asserted</td><td><code>mounted::semantics::namespace_and_metadata</code></td></tr>
+<tr><td><code>metadata.attributes</code></td><td><code>getattr</code>; chmod; atime/mtime; truncate shrink/grow</td><td><code>mounted::semantics::namespace_and_metadata</code></td></tr>
+<tr><td><code>io.eof-empty</code></td><td>Empty files and reads at, across, and past EOF</td><td><code>mounted::semantics::io_boundaries</code></td></tr>
+<tr><td><code>io.sparse-truncate</code></td><td>Sparse holes and truncation</td><td><code>mounted::semantics::io_boundaries</code></td></tr>
+<tr><td><code>io.multiblock-chunk</code></td><td>Unaligned multi-block writes and files spanning the 64 MiB chunk boundary</td><td><code>mounted::semantics::io_boundaries</code></td></tr>
+<tr><td><code>descriptor.lifecycle</code></td><td>Multiple descriptors, repeated flush, and unlink/rename while open</td><td><code>mounted::semantics::descriptor_lifecycle</code></td></tr>
+<tr><td><code>concurrency.disjoint</code></td><td>Parallel writes to disjoint ranges</td><td><code>mounted::concurrency::ordered_and_disjoint_writes</code></td></tr>
+<tr><td><code>concurrency.ordered-overlap</code></td><td>Overlapping writes with explicit ordering and concurrent post-flush reads</td><td><code>mounted::concurrency::ordered_and_disjoint_writes</code></td></tr>
+<tr><td><code>durability.flush-local</code></td><td>A successful FUSE flush/close is recoverable from the configured local stage</td><td><code>mounted::lifecycle::crash_after_local_flush</code></td></tr>
+<tr><td><code>durability.fsync-remote</code></td><td><code>fsync</code>/<code>fdatasync</code> return only after data reaches object storage</td><td><code>mounted::lifecycle::crash_after_fsync</code></td></tr>
+<tr><td><code>lifecycle.clean-remount</code></td><td>Clean remount preserves namespace, metadata, sparse layout, and bytes</td><td><code>mounted::lifecycle::clean_remount_and_read_only</code></td></tr>
+<tr><td><code>lifecycle.read-only</code></td><td>Reads work; create, write, truncate, and unlink fail with <code>EROFS</code></td><td><code>mounted::lifecycle::clean_remount_and_read_only</code></td></tr>
+<tr><td><code>lifecycle.invalid-storage</code></td><td>Invalid object-store configuration exits nonzero before mount readiness</td><td><code>mounted::lifecycle::clean_remount_and_read_only</code></td></tr>
+<tr><td><code>lifecycle.crash-fsync</code></td><td>Immediate <code>SIGKILL</code> after <code>fsync</code> preserves exact remote-durable bytes</td><td><code>mounted::lifecycle::crash_after_fsync</code></td></tr>
+<tr><td><code>lifecycle.crash-flush</code></td><td>Immediate <code>SIGKILL</code> after local flush recovers the staged copy</td><td><code>mounted::lifecycle::crash_after_local_flush</code></td></tr>
+<tr><td><code>fs.statfs</code></td><td><code>statfs</code> returns internally consistent block and inode counts</td><td><code>mounted::semantics::namespace_and_metadata</code></td></tr>
+</tbody></table>
+</div>
+<h2 id="intentionally-unsupported"><a class="header" href="#intentionally-unsupported">Intentionally unsupported</a></h2>
+<div class="table-wrapper"><table><thead><tr><th>Case ID</th><th>Operation</th><th>Stable Linux errno</th></tr></thead><tbody>
+<tr><td><code>unsupported.fallocate</code></td><td>Recognized <code>fallocate</code> allocation/punch modes</td><td><code>EOPNOTSUPP</code></td></tr>
+<tr><td><code>unsupported.xattr</code></td><td>Extended attributes and ACL storage</td><td><code>ENOSYS</code></td></tr>
+<tr><td><code>unsupported.locks</code></td><td>POSIX and BSD advisory locking callbacks</td><td><code>ENOSYS</code></td></tr>
+<tr><td><code>unsupported.ioctl</code></td><td>Filesystem-specific <code>ioctl</code></td><td><code>ENOSYS</code></td></tr>
+<tr><td><code>unsupported.copy-file-range</code></td><td>FUSE-native <code>copy_file_range</code> acceleration</td><td><code>ENOSYS</code></td></tr>
+</tbody></table>
+</div>
+<p>The mounted unsupported test directly asserts <code>fallocate</code> and then performs a
+normal write/read to prove the mount remains live. The other entries retain
+fuser's default <code>ENOSYS</code> callback behavior and are documented so future callback
+implementations must update this matrix and the manifest in the same change.</p>
+<h2 id="experimental-behavior"><a class="header" href="#experimental-behavior">Experimental behavior</a></h2>
+<div class="table-wrapper"><table><thead><tr><th>Case ID</th><th>Operation</th><th>Caveat</th></tr></thead><tbody>
+<tr><td><code>experimental.mknod</code></td><td>Special-file <code>mknod</code></td><td>Callback coverage does not yet prove device or FIFO semantics.</td></tr>
+<tr><td><code>experimental.readdirplus</code></td><td><code>readdirplus</code></td><td>The kernel can choose plain <code>readdir</code>; the callback is not independently forced by the gate.</td></tr>
+<tr><td><code>experimental.supplementary-groups</code></td><td>Supplementary-group authorization</td><td>Primary gid participates in checks; a complete supplementary-group contract is not mounted-tested.</td></tr>
+</tbody></table>
+</div>
+<h2 id="durability-and-platform-boundaries"><a class="header" href="#durability-and-platform-boundaries">Durability and platform boundaries</a></h2>
+<ul>
+<li>The contract is Linux-only and requires FUSE 3, <code>/dev/fuse</code>, and
+<code>fusermount3</code>.</li>
+<li><code>write(2)</code> alone may remain memory-buffered.</li>
+<li>Close/flush acknowledges synced local staging plus atomic metadata
+publication. <code>fsync</code> and <code>fdatasync</code> additionally wait for remote object
+durability.</li>
+<li>Required tests use RocksDB metadata and <code>file:///...</code> object storage rooted in
+a per-test temporary directory. They require no network service or secrets.</li>
+<li>KisekiFS targets production use but is not yet production-qualified. Passing
+this matrix does not imply broad POSIX, multi-node, upgrade, backup, or
+long-running workload qualification.</li>
+</ul>
+<p>Run the gate on a capable Linux host with <code>just test-mounted</code>. The command
+refuses to skip when <code>/dev/fuse</code> or <code>fusermount3</code> is unavailable.</p>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="bench.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <i class="fa fa-angle-left"></i>
+                            </a>
+
+                            <a rel="next" href="operator-runbook.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <i class="fa fa-angle-right"></i>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="bench.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <i class="fa fa-angle-left"></i>
+                    </a>
+
+                    <a rel="next" href="operator-runbook.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <i class="fa fa-angle-right"></i>
+                    </a>
+            </nav>
+
+        </div>
+
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="elasticlunr.min.js"></script>
+        <script src="mark.min.js"></script>
+        <script src="searcher.js"></script>
+
+        <script src="clipboard.min.js"></script>
+        <script src="highlight.js"></script>
+        <script src="book.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+    </div>
+    </body>
+</html>
