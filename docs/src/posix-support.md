@@ -70,8 +70,9 @@ implementations must update this matrix and the manifest in the same change.
   durability.
 - Required tests use RocksDB metadata and `file:///...` object storage rooted in
   a per-test temporary directory. They require no network service or secrets.
-- KisekiFS remains a learning project. Passing this matrix does not imply broad
-  POSIX, multi-node, upgrade, backup, or long-running workload qualification.
+- KisekiFS targets production use but is not yet production-qualified. Passing
+  this matrix does not imply broad POSIX, multi-node, upgrade, backup, or
+  long-running workload qualification.
 
 Run the gate on a capable Linux host with `just test-mounted`. The command
 refuses to skip when `/dev/fuse` or `fusermount3` is unavailable.
