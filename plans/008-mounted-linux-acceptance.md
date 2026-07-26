@@ -12,13 +12,14 @@
 
 ## Status
 
-- **State**: IN PROGRESS
+- **State**: DONE
 - **Priority**: P1
 - **Effort**: L
 - **Risk**: MED
 - **Depends on**: `plans/006-crash-consistent-write-publication.md`, `plans/007-safe-buffer-data-path.md`
 - **Category**: tests / docs
 - **Planned at**: commit `2fb2c95`, 2026-07-20
+
 ### Local completion evidence at 2026-07-26
 
 Implemented the versioned Linux support contract, machine-checked manifest,
@@ -38,6 +39,19 @@ Local verification on `rara-linux`:
 - an intentional mounted smoke failure followed by zero leaked mount,
   process, or temporary root
 
+### Remote completion evidence at 2026-07-26
+
+- GitHub Actions run `30191772097`: `Mounted Linux Acceptance` passed.
+- GitHub Actions run `30191908925`: `Mounted Linux Acceptance` passed again.
+- GitHub Actions run `30192201516`: the full CI workflow passed, including a
+  third `Mounted Linux Acceptance` run and Miri buffer-ownership checks.
+- All three runs also passed the workspace test, Clippy, formatting,
+  documentation, coverage, advisory, and mounted-test aggregator jobs.
+
+The first two runs' unrelated Miri job exposed two CI/nightly compatibility
+defects: missing FUSE headers and expression-position use of a SNAFU macro.
+Commits `1fabe9e` and `3e9b59d` fix those defects without weakening the mounted
+gate.
 
 ## Why this matters
 
@@ -257,15 +271,15 @@ production-ready. Document exact local prerequisites and `just test-mounted`.
 
 ## Done criteria
 
-- [ ] A required Linux job mounts the real binary through `/dev/fuse`.
-- [ ] Every documented supported case has a registered mounted test.
-- [ ] Namespace, metadata, I/O, concurrency, fsync/crash, remount, and read-only
+- [x] A required Linux job mounts the real binary through `/dev/fuse`.
+- [x] Every documented supported case has a registered mounted test.
+- [x] Namespace, metadata, I/O, concurrency, fsync/crash, remount, and read-only
       groups pass.
-- [ ] Unsupported cases return stable errno without killing the mount.
-- [ ] Failed/timed-out tests leave no mount, process, or foreign temp path.
-- [ ] README claims match the versioned support matrix.
-- [ ] Mounted suite passes twice remotely; unit/check/lint/format gates pass.
-- [ ] `plans/README.md` is updated with completion evidence.
+- [x] Unsupported cases return stable errno without killing the mount.
+- [x] Failed/timed-out tests leave no mount, process, or foreign temp path.
+- [x] README claims match the versioned support matrix.
+- [x] Mounted suite passes twice remotely; unit/check/lint/format gates pass.
+- [x] `plans/README.md` is updated with completion evidence.
 
 ## STOP conditions
 

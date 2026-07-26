@@ -18,7 +18,7 @@ honor its STOP conditions, run every gate, and update the status here.
 | 005 | Make the FUSE request boundary panic-free and correct | P1 | M | 001 | DONE |
 | 006 | Make write publication crash-consistent and restart-recoverable | P1 | L | 005 | DONE |
 | 007 | Eliminate unsafe aliasing from the buffer data path | P1 | M | 006 | DONE |
-| 008 | Add a mounted Linux acceptance gate and supported-semantics contract | P1 | L | 006, 007 | IN PROGRESS |
+| 008 | Add a mounted Linux acceptance gate and supported-semantics contract | P1 | L | 006, 007 | DONE |
 | 009 | Make mount resources instance-scoped, observable, and gracefully drained | P1 | L | 006, 007, 008 | TODO |
 | 010 | Add offline, verified metadata backup and restore | P1 | L | 006, 009 | TODO |
 
