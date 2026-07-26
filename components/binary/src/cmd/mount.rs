@@ -442,6 +442,14 @@ pub struct MountArgs {
     )]
     pub async_work_threads: usize,
 
+    #[arg(
+    long,
+    help = "FUSE backend: 'rara' (fuse-backend-rs, default) or 'fuser' (legacy)",
+    help_heading = MOUNT_OPTIONS_HEADER,
+    default_value = "rara",
+    )]
+    pub fuse_backend: String,
+
     #[clap(
     long,
     help = "Write log files to a directory [default: logs written to syslog]",
@@ -768,6 +776,41 @@ fn mount(args: MountArgs) -> Result<(), Whatever> {
 
     let meta = kiseki_meta::open(meta_config)
         .with_whatever_context(|e| format!("failed to open meta, {e:?}"))?;
+
+    if args.fuse_backend != "fuser" {
+        // Default: fuse-backend-rs. The VFS keeps its own long-lived
+        // multi-threaded runtime; the fusedev worker threads bridge into it via
+        // block_on.
+        let threads = args.async_work_threads.max(1);
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(threads)
+            .thread_name("kiseki-vfs")
+            .enable_all()
+            .build()
+            .with_whatever_context(|error| format!("failed to build vfs runtime: {error}"))?;
+        let vfs = runtime
+            .block_on(KisekiVFS::new_checked(vfs_config, meta))
+            .with_whatever_context(|e| format!("failed to create file system, {e:?}"))?;
+        let vfs = std::sync::Arc::new(vfs);
+        runtime
+            .block_on(vfs.init(&kiseki_meta::context::FuseContext::background()))
+            .with_whatever_context(|e| format!("failed to initialize file system, {e:?}"))?;
+        kiseki_fuse::fbr::mount_and_serve(
+            vfs,
+            runtime.handle().clone(),
+            &args.mount_point,
+            KISEKI,
+            args.allow_other,
+            args.read_only,
+            threads,
+        )
+        .with_whatever_context(|e| {
+            format!("failed to mount kiseki on {}; {e}", args.mount_point.display())
+        })?;
+        drop(runtime);
+        return Ok(());
+    }
+
     let fuse_runtime = kiseki_fuse::KisekiFuse::build_runtime(&fuse_config)?;
     let shutdown_runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()

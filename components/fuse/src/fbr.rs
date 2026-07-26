@@ -35,10 +35,14 @@ use std::{ffi::CStr, io, path::Path, sync::Arc, time::Duration};
 
 use fuse_backend_rs::{
     abi::fuse_abi::{CreateIn, stat64, statvfs64},
-    api::filesystem::{
-        Context, DirEntry, Entry, FileSystem, FsOptions, OpenOptions, SetattrValid, ZeroCopyReader,
-        ZeroCopyWriter,
+    api::{
+        filesystem::{
+            Context, DirEntry, Entry, FileSystem, FsOptions, OpenOptions, SetattrValid,
+            ZeroCopyReader, ZeroCopyWriter,
+        },
+        server::Server,
     },
+    transport::{FuseChannel, FuseSession},
 };
 use fuser::TimeOrNow;
 use kiseki_common::{BLOCK_SIZE, MAX_NAME_LENGTH};
@@ -51,6 +55,7 @@ use kiseki_types::{
 };
 use kiseki_vfs::KisekiVFS;
 use tokio::runtime::Handle;
+use tracing::{error, info};
 
 // ---------------------------------------------------------------------------
 // conversions
@@ -679,5 +684,74 @@ impl FileSystem for KisekiFsBackend {
         st.f_favail = u64::MAX - state.file_count;
         st.f_namemax = MAX_NAME_LENGTH as u64;
         Ok(st)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// mount + serve
+// ---------------------------------------------------------------------------
+
+/// Mount KisekiFS at `mountpoint` via fuse-backend-rs and serve requests on
+/// `num_threads` worker threads until the filesystem is unmounted. Blocks the
+/// calling thread until then.
+///
+/// `vfs_rt` must be a live multi-threaded Tokio runtime handle owning the VFS'
+/// background tasks; it has to outlive this call.
+pub fn mount_and_serve(
+    vfs: Arc<KisekiVFS>,
+    vfs_rt: Handle,
+    mountpoint: &Path,
+    fsname: &str,
+    allow_other: bool,
+    read_only: bool,
+    num_threads: usize,
+) -> io::Result<()> {
+    let backend = KisekiFsBackend::new(vfs, vfs_rt);
+    let server = Arc::new(Server::new(backend));
+
+    let mut session = FuseSession::new(mountpoint, fsname, "", read_only)
+        .map_err(|e| io::Error::other(format!("create fuse session: {e}")))?;
+    session.set_allow_other(allow_other);
+    session
+        .mount()
+        .map_err(|e| io::Error::other(format!("mount fuse session: {e}")))?;
+    info!("kiseki (fuse-backend-rs) mounted at {mountpoint:?} with {num_threads} worker(s)");
+
+    let threads = (0..num_threads.max(1))
+        .map(|i| {
+            let channel = session
+                .new_channel()
+                .map_err(|e| io::Error::other(format!("create fuse channel: {e}")))?;
+            let server = server.clone();
+            std::thread::Builder::new()
+                .name(format!("kiseki-fuse-{i}"))
+                .spawn(move || serve(&server, channel))
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+
+    for t in threads {
+        let _ = t.join();
+    }
+    let _ = session.umount();
+    Ok(())
+}
+
+/// Per-worker request loop.
+fn serve(server: &Server<KisekiFsBackend>, mut channel: FuseChannel) {
+    loop {
+        match channel.get_request() {
+            Ok(Some((reader, writer))) => {
+                if let Err(e) = server.handle_message(reader, writer.into(), None, None) {
+                    error!("fuse: handle_message error: {e}");
+                }
+            }
+            // `None` means the exit event fired (unmount); the device error path
+            // ends the worker as well.
+            Ok(None) => break,
+            Err(e) => {
+                error!("fuse: get_request error: {e}");
+                break;
+            }
+        }
     }
 }
