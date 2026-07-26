@@ -73,6 +73,18 @@ pub enum Error {
         location:  Location,
     },
 
+    #[snafu(display("disk page pool capacity requires an explicit path"))]
+    MissingDiskPagePoolPath {
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("page pool is exhausted"))]
+    PagePoolExhausted {
+        #[snafu(implicit)]
+        location: Location,
+    },
+
     #[snafu(display("unexpected {subject} length: expected {expected}, got {actual}"))]
     UnexpectedLength {
         subject:  &'static str,
@@ -99,6 +111,13 @@ pub enum Error {
 impl Error {
     pub const fn is_not_found(&self) -> bool {
         matches!(self, Self::ObjectStorageError { source, .. } if kiseki_utils::object_storage::is_not_found_error(source))
+    }
+
+    pub const fn is_no_space(&self) -> bool {
+        matches!(
+            self,
+            Self::PagePoolExhausted { .. } | Self::ErrStageNoMoreSpace { .. }
+        )
     }
 }
 

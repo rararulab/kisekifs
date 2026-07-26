@@ -16,11 +16,13 @@
 
 mod config;
 
-pub use config::Config;
+pub use config::{Config, ShutdownPolicy};
 mod err;
 mod handle;
 mod kiseki;
 pub use kiseki::KisekiVFS;
+pub use lifecycle::{LifecycleState, OperationGuard, ShutdownError, ShutdownReport};
 mod data_manager;
+mod lifecycle;
 mod reader;
 mod writer;

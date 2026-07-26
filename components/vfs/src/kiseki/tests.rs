@@ -49,10 +49,13 @@ mod test_utils {
 
         let meta_engine = kiseki_meta::open(meta_config).unwrap();
         let vfs_config = Config {
-            stage_cache_dir: tempdir.path().join("stage"),
+            cache_dir: tempdir.path().join("cache"),
+            memory_page_capacity: kiseki_utils::readable_size::ReadableSize(
+                (kiseki_common::BLOCK_SIZE * 4) as u64,
+            ),
             ..Config::default()
         };
-        KisekiVFS::new(vfs_config, meta_engine).unwrap()
+        KisekiVFS::new(vfs_config, meta_engine).await.unwrap()
     }
 
     /// 创建用于测试的VFS实例 - rstest fixture
@@ -67,10 +70,13 @@ mod test_utils {
 
         let meta_engine = kiseki_meta::open(meta_config).unwrap();
         let vfs_config = Config {
-            stage_cache_dir: tempdir.path().join("stage"),
+            cache_dir: tempdir.path().join("cache"),
+            memory_page_capacity: kiseki_utils::readable_size::ReadableSize(
+                (kiseki_common::BLOCK_SIZE * 4) as u64,
+            ),
             ..Config::default()
         };
-        let vfs = Arc::new(KisekiVFS::new(vfs_config, meta_engine).unwrap());
+        let vfs = Arc::new(KisekiVFS::new(vfs_config, meta_engine).await.unwrap());
         let ctx = Arc::new(FuseContext::background());
 
         // 初始化VFS

@@ -26,6 +26,7 @@ use kiseki_common::MAX_FILE_SIZE;
 #[cfg(test)]
 use kiseki_common::{MODE_MASK_R, MODE_MASK_W};
 use kiseki_meta::{MetaEngineRef, context::FuseContext};
+use kiseki_storage::pool::PagePoolBuilder;
 use kiseki_types::{
     attr::InodeAttr,
     ino::{CONTROL_INODE, Ino, ROOT_INO},
@@ -34,13 +35,18 @@ use kiseki_types::{
 use kiseki_utils::object_storage::ObjectStorage;
 use libc::{EACCES, EBADF, EFBIG, EPERM, mode_t};
 use snafu::{ResultExt, ensure};
+use tokio::{
+    sync::OnceCell,
+    time::{Instant as TokioInstant, timeout_at},
+};
 use tracing::{debug, info, trace};
 
 use crate::{
-    config::Config,
+    config::{Config, PreparedCacheConfig},
     data_manager::{DataManager, DataManagerRef},
     err::{LibcSnafu, MetaSnafu, ObjectStorageConfigSnafu, ObjectStorageSnafu, Result},
     handle::{HandleTable, HandleTableRef},
+    lifecycle::{MountLifecycle, OperationGuard, ShutdownError, ShutdownReport},
 };
 
 pub struct KisekiVFS {
@@ -54,6 +60,9 @@ pub struct KisekiVFS {
 
     // Dependencies
     pub(crate) meta: MetaEngineRef,
+    _cache:          PreparedCacheConfig,
+    lifecycle:       Arc<MountLifecycle>,
+    shutdown_result: OnceCell<std::result::Result<ShutdownReport, ShutdownError>>,
 }
 
 impl Debug for KisekiVFS {
@@ -83,15 +92,19 @@ impl KisekiVFS {
     }
 
     #[cfg(test)]
-    pub(crate) fn new(vfs_config: Config, meta: MetaEngineRef) -> Result<Self> {
+    pub(crate) async fn new(vfs_config: Config, meta: MetaEngineRef) -> Result<Self> {
+        vfs_config.validate_storage_cache_paths()?;
         let object_storage = vfs_config
             .object_storage
             .build()
             .context(ObjectStorageConfigSnafu)?;
-        Self::new_with_object_storage(vfs_config, meta, object_storage)
+        let vfs = Self::new_with_object_storage(vfs_config, meta, object_storage).await?;
+        vfs.lifecycle.mark_ready();
+        Ok(vfs)
     }
 
     pub async fn new_checked(vfs_config: Config, meta: MetaEngineRef) -> Result<Self> {
+        vfs_config.validate_storage_cache_paths()?;
         let object_storage = vfs_config
             .object_storage
             .build()
@@ -103,14 +116,19 @@ impl KisekiVFS {
             prefix = ?vfs_config.object_storage.prefix(),
             "object storage is ready"
         );
-        Self::new_with_object_storage(vfs_config, meta, object_storage)
+        Self::new_with_object_storage(vfs_config, meta, object_storage).await
     }
 
-    fn new_with_object_storage(
+    async fn new_with_object_storage(
         vfs_config: Config,
         meta: MetaEngineRef,
         object_storage: ObjectStorage,
     ) -> Result<Self> {
+        let lifecycle = MountLifecycle::new();
+        info!(state = %lifecycle.state(), "mount lifecycle starting");
+        lifecycle.mark_recovering();
+        info!(state = %lifecycle.state(), "mount lifecycle recovering");
+        let prepared_cache = vfs_config.prepare(meta.get_format())?;
         let mut internal_nodes =
             InternalNodeTable::new((vfs_config.file_entry_timeout, vfs_config.dir_entry_timeout));
         let config_inode = internal_nodes
@@ -126,14 +144,30 @@ impl KisekiVFS {
             internal_nodes.add_prefix();
         }
 
+        let page_pool_builder = PagePoolBuilder::default()
+            .with_page_size(vfs_config.page_size)
+            .with_memory_capacity(prepared_cache.memory_page_capacity);
+        let page_pool_builder = if let Some(disk_capacity) = prepared_cache.disk_page_capacity {
+            page_pool_builder
+                .with_disk_capacity_and_path(disk_capacity, &prepared_cache.disk_page_pool_path)
+        } else {
+            page_pool_builder
+        };
+        let page_pool = Arc::new(page_pool_builder.build().await?);
+
         let data_manager = Arc::new(DataManager::new(
             vfs_config.chunk_size,
             meta.clone(),
             object_storage,
             kiseki_storage::cache::file_cache::Config {
-                stage_cache_dir: vfs_config.stage_cache_dir.clone(),
-                ..Default::default()
+                stage_cache_dir: prepared_cache.stage_dir().to_path_buf(),
+                max_stage_size:  prepared_cache.stage_cache_capacity,
+                cache_ttl:       prepared_cache.stage_cache_ttl,
             },
+            kiseki_storage::cache::mem_cache::Config {
+                capacity: prepared_cache.memory_read_cache_capacity,
+            },
+            page_pool,
         )?);
 
         let vfs = Self {
@@ -143,11 +177,177 @@ impl KisekiVFS {
             handle_table: HandleTable::new(data_manager.clone()),
             data_manager,
             meta,
+            _cache: prepared_cache,
+            lifecycle,
+            shutdown_result: OnceCell::new(),
         };
 
         // TODO: spawn a background task to clean up modified time.
 
         Ok(vfs)
+    }
+
+    pub fn lifecycle_state(&self) -> crate::LifecycleState { self.lifecycle.state() }
+
+    pub fn volume_name(&self) -> &str { &self.meta.get_format().name }
+
+    pub fn begin_operation(&self) -> Option<OperationGuard> { self.lifecycle.begin_operation() }
+
+    pub async fn shutdown(
+        &self,
+        deadline: Duration,
+    ) -> std::result::Result<ShutdownReport, ShutdownError> {
+        self.shutdown_result
+            .get_or_init(|| self.run_shutdown(deadline))
+            .await
+            .clone()
+    }
+
+    async fn run_shutdown(
+        &self,
+        deadline: Duration,
+    ) -> std::result::Result<ShutdownReport, ShutdownError> {
+        let started = std::time::Instant::now();
+        let deadline_at = TokioInstant::now() + deadline;
+        self.lifecycle.begin_draining();
+        self.data_manager.tasks.begin_draining();
+        let active_operations = self.lifecycle.active_operations();
+        info!(active_operations, ?deadline, "mount lifecycle draining");
+
+        let mut timed_out = false;
+        let mut errors = Vec::new();
+        if timeout_at(deadline_at, self.lifecycle.wait_for_operations())
+            .await
+            .is_err()
+        {
+            timed_out = true;
+            errors.push("timed out waiting for active filesystem operations".to_string());
+        }
+
+        let staged_pending_before = if timed_out {
+            0
+        } else {
+            match timeout_at(deadline_at, self.data_manager.file_cache.pending_count()).await {
+                Ok(count) => count,
+                Err(_) => {
+                    timed_out = true;
+                    errors.push("timed out reading staged cache state".to_string());
+                    0
+                }
+            }
+        };
+
+        let (writers_total, writers_flushed) = if timed_out {
+            (0, 0)
+        } else {
+            match timeout_at(deadline_at, self.data_manager.flush_all_writers_local()).await {
+                Ok((total, flushed, writer_errors)) => {
+                    errors.extend(
+                        writer_errors
+                            .into_iter()
+                            .take(8usize.saturating_sub(errors.len())),
+                    );
+                    (total, flushed)
+                }
+                Err(_) => {
+                    timed_out = true;
+                    errors.push("timed out flushing writers to local durable storage".to_string());
+                    (self.data_manager.file_writers.len(), 0)
+                }
+            }
+        };
+
+        if !timed_out && self.config.shutdown_policy == crate::ShutdownPolicy::RemoteDurable {
+            match timeout_at(deadline_at, self.data_manager.file_cache.flush_all()).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) if errors.len() < 8 => {
+                    errors.push(format!("remote stage drain failed: {error}"));
+                }
+                Ok(Err(_)) => {}
+                Err(_) => {
+                    timed_out = true;
+                    if errors.len() < 8 {
+                        errors
+                            .push("timed out draining staged blocks to remote storage".to_string());
+                    }
+                }
+            }
+        }
+
+        self.data_manager.cancel_all_writers();
+        self.data_manager.tasks.cancel();
+        let mut tasks_aborted = 0;
+        if timeout_at(deadline_at, self.data_manager.tasks.wait())
+            .await
+            .is_err()
+        {
+            timed_out = true;
+            tasks_aborted = self.data_manager.tasks.abort_all();
+            if tokio::time::timeout(Duration::from_millis(100), self.data_manager.tasks.wait())
+                .await
+                .is_err()
+                && errors.len() < 8
+            {
+                errors.push(
+                    "aborted background tasks did not join within the grace period".to_string(),
+                );
+            }
+            if errors.len() < 8 {
+                errors.push("background task drain exceeded the shutdown deadline".to_string());
+            }
+        }
+
+        let staged_pending_after = self
+            .data_manager
+            .file_cache
+            .try_pending_count()
+            .unwrap_or_else(|| {
+                if errors.len() < 8 {
+                    errors.push(
+                        "could not snapshot staged cache without exceeding shutdown deadline"
+                            .to_string(),
+                    );
+                }
+                staged_pending_before
+            });
+        let tasks = self.data_manager.tasks.snapshot();
+        if tasks.active == 0 {
+            self.lifecycle.mark_stopped();
+        } else {
+            self.lifecycle.mark_shutdown_failed();
+        }
+        let report = ShutdownReport {
+            state: self.lifecycle.state(),
+            active_operations,
+            writers_total,
+            writers_flushed,
+            staged_pending_before,
+            staged_pending_after,
+            tasks,
+            tasks_aborted,
+            elapsed: started.elapsed(),
+            timed_out,
+            errors,
+        };
+        info!(
+            clean = report.is_clean(),
+            writers_total = report.writers_total,
+            writers_flushed = report.writers_flushed,
+            staged_pending_after = report.staged_pending_after,
+            tasks_spawned = report.tasks.spawned,
+            tasks_completed = report.tasks.completed,
+            tasks_panicked = report.tasks.panicked,
+            tasks_aborted = report.tasks_aborted,
+            elapsed_ms = report.elapsed.as_millis(),
+            "mount lifecycle stopped"
+        );
+        if report.is_clean() {
+            Ok(report)
+        } else {
+            Err(ShutdownError {
+                report: Box::new(report),
+            })
+        }
     }
 
     async fn truncate(
@@ -286,6 +486,18 @@ impl KisekiVFS {
     /// # References
     /// * [FUSE init](https://libfuse.github.io/doxygen/structfuse__operations.html#a39a048c8a19c7b02fec706f43ec68b29)
     pub async fn init(&self, ctx: &FuseContext) -> Result<()> {
+        let result = self.init_inner(ctx).await;
+        if result.is_ok() {
+            self.lifecycle.mark_ready();
+            info!(state = %self.lifecycle.state(), "mount lifecycle ready");
+        } else {
+            self.lifecycle.mark_failed();
+            info!(state = %self.lifecycle.state(), "mount lifecycle failed");
+        }
+        result
+    }
+
+    async fn init_inner(&self, ctx: &FuseContext) -> Result<()> {
         debug!("vfs:init - starting KisekiFS initialization");
 
         // 1. Validate filesystem format and version
@@ -323,8 +535,9 @@ impl KisekiVFS {
 
         // 4. Initialize data manager cache and buffers
         debug!(
-            "Initializing data manager with {} total buffer capacity",
-            self.config.total_buffer_capacity
+            cache_root = %self._cache.root().display(),
+            memory_page_capacity = %self.config.memory_page_capacity,
+            "data manager caches and buffers are initialized"
         );
 
         // 5. Log configuration summary
@@ -337,9 +550,12 @@ impl KisekiVFS {
         info!("  - Page size: {}KB", self.config.page_size / 1024);
         info!(
             "  - Total buffer capacity: {}MB",
-            self.config.total_buffer_capacity / (1024 * 1024)
+            self.config.memory_page_capacity.as_mb()
         );
-        info!("  - Cache capacity: {}KB", self.config.capacity / 1024);
+        info!(
+            "  - Memory read cache capacity: {}",
+            self.config.memory_read_cache_capacity
+        );
         info!("  - Attr timeout: {:?}", self.config.attr_timeout);
         info!("  - Dir entry timeout: {:?}", self.config.dir_entry_timeout);
         info!(
@@ -446,8 +662,11 @@ mod tests;
 
 #[cfg(test)]
 mod object_storage_tests {
-    use kiseki_types::setting::Format;
-    use kiseki_utils::object_storage::ObjectStorageConfig;
+    use std::{sync::Arc, time::Duration};
+
+    use kiseki_meta::context::FuseContext;
+    use kiseki_types::{ino::ROOT_INO, setting::Format};
+    use kiseki_utils::{object_storage::ObjectStorageConfig, readable_size::ReadableSize};
 
     use super::KisekiVFS;
     use crate::{Config, err::Error};
@@ -465,10 +684,231 @@ mod object_storage_tests {
         std::fs::write(&invalid_root, b"not a directory").unwrap();
         let config = Config {
             object_storage: ObjectStorageConfig::File { root: invalid_root },
+            cache_dir: storage_dir.path().join("cache"),
             ..Config::default()
         };
 
         let result = KisekiVFS::new_checked(config, meta).await;
         assert!(matches!(result, Err(Error::ObjectStorageConfig { .. })));
+    }
+
+    #[tokio::test]
+    async fn vfs_instances_have_isolated_page_pools_and_reopen_owned_disk_paths() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let mut meta_config = kiseki_meta::MetaConfig::default();
+        meta_config.with_dsn(&format!(
+            "rocksdb://:{}",
+            tempdir.path().join("meta").display()
+        ));
+        kiseki_meta::update_format(&meta_config.dsn, Format::default(), false).unwrap();
+        let meta = kiseki_meta::open(meta_config).unwrap();
+
+        let first_config = Config {
+            cache_dir: tempdir.path().join("cache-a"),
+            memory_page_capacity: ReadableSize(kiseki_common::PAGE_SIZE as u64),
+            disk_page_capacity: Some(ReadableSize(kiseki_common::PAGE_SIZE as u64)),
+            ..Config::default()
+        };
+        let second_config = Config {
+            cache_dir: tempdir.path().join("cache-b"),
+            memory_page_capacity: ReadableSize((kiseki_common::PAGE_SIZE * 2) as u64),
+            ..Config::default()
+        };
+        let first = KisekiVFS::new(first_config.clone(), meta.clone())
+            .await
+            .unwrap();
+        let second = KisekiVFS::new(second_config, meta.clone()).await.unwrap();
+
+        let first_memory_page = first.data_manager.page_pool.acquire_page().await;
+        let first_disk_page = first.data_manager.page_pool.acquire_page().await;
+        assert_eq!(first.data_manager.page_pool.remain(), 0);
+        assert_eq!(second.data_manager.page_pool.remain(), 2);
+
+        drop(first_memory_page);
+        drop(first_disk_page);
+        drop(first);
+        let reopened = KisekiVFS::new(first_config, meta).await.unwrap();
+        assert_eq!(reopened.data_manager.page_pool.remain(), 2);
+    }
+
+    #[tokio::test]
+    async fn concurrent_shutdown_is_idempotent_and_closes_task_admission() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let mut meta_config = kiseki_meta::MetaConfig::default();
+        meta_config.with_dsn(&format!(
+            "rocksdb://:{}",
+            tempdir.path().join("meta").display()
+        ));
+        kiseki_meta::update_format(&meta_config.dsn, Format::default(), false).unwrap();
+        let meta = kiseki_meta::open(meta_config).unwrap();
+        let vfs = Arc::new(
+            KisekiVFS::new(
+                Config {
+                    cache_dir: tempdir.path().join("cache"),
+                    memory_page_capacity: ReadableSize(kiseki_common::PAGE_SIZE as u64),
+                    ..Config::default()
+                },
+                meta,
+            )
+            .await
+            .unwrap(),
+        );
+        vfs.data_manager
+            .open_file_writer(kiseki_types::ino::Ino(123), 0)
+            .unwrap();
+
+        let (first, second) = tokio::join!(
+            vfs.shutdown(Duration::from_secs(1)),
+            vfs.shutdown(Duration::from_secs(1))
+        );
+        assert_eq!(first, second);
+        let report = first.unwrap();
+        assert!(report.is_clean());
+        assert_eq!(report.tasks.active, 0);
+        assert_eq!(vfs.lifecycle_state(), crate::LifecycleState::Stopped);
+        assert!(
+            vfs.data_manager
+                .open_file_writer(kiseki_types::ino::Ino(124), 0)
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_aborts_and_joins_a_worker_that_ignores_cancellation() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let mut meta_config = kiseki_meta::MetaConfig::default();
+        meta_config.with_dsn(&format!(
+            "rocksdb://:{}",
+            tempdir.path().join("meta").display()
+        ));
+        kiseki_meta::update_format(&meta_config.dsn, Format::default(), false).unwrap();
+        let meta = kiseki_meta::open(meta_config).unwrap();
+        let vfs = KisekiVFS::new(
+            Config {
+                cache_dir: tempdir.path().join("cache"),
+                memory_page_capacity: ReadableSize(kiseki_common::PAGE_SIZE as u64),
+                ..Config::default()
+            },
+            meta,
+        )
+        .await
+        .unwrap();
+        assert!(vfs.data_manager.tasks.spawn(std::future::pending()));
+
+        let error = vfs.shutdown(Duration::from_millis(1)).await.unwrap_err();
+        assert!(error.report.timed_out);
+        assert_eq!(error.report.tasks_aborted, 1);
+        assert_eq!(error.report.tasks.active, 0);
+    }
+
+    #[tokio::test]
+    async fn shutdown_reports_local_flush_failure_and_still_joins_workers() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let mut meta_config = kiseki_meta::MetaConfig::default();
+        meta_config.with_dsn(&format!(
+            "rocksdb://:{}",
+            tempdir.path().join("meta").display()
+        ));
+        kiseki_meta::update_format(&meta_config.dsn, Format::default(), false).unwrap();
+        let meta = kiseki_meta::open(meta_config).unwrap();
+        let (inode, _) = meta
+            .create(
+                Arc::new(FuseContext::background()),
+                ROOT_INO,
+                "dirty-on-shutdown",
+                0o600,
+                0,
+                0,
+            )
+            .await
+            .unwrap();
+        let cache_dir = tempdir.path().join("cache");
+        let vfs = KisekiVFS::new(
+            Config {
+                cache_dir: cache_dir.clone(),
+                memory_page_capacity: ReadableSize(kiseki_common::PAGE_SIZE as u64),
+                ..Config::default()
+            },
+            meta,
+        )
+        .await
+        .unwrap();
+        let writer = vfs.data_manager.open_file_writer(inode, 0).unwrap();
+        writer
+            .write(0, b"must report local durability failure")
+            .await
+            .unwrap();
+
+        let stage_dir = cache_dir.join("stage");
+        std::fs::remove_dir(&stage_dir).unwrap();
+        std::fs::write(&stage_dir, b"stage path is unavailable").unwrap();
+
+        let error = vfs.shutdown(Duration::from_secs(1)).await.unwrap_err();
+        assert_eq!(error.report.writers_total, 1);
+        assert_eq!(error.report.writers_flushed, 0);
+        assert!(!error.report.errors.is_empty());
+        assert_eq!(error.report.tasks.active, 0);
+        assert_eq!(vfs.lifecycle_state(), crate::LifecycleState::Stopped);
+    }
+
+    #[tokio::test]
+    async fn remote_shutdown_policy_reports_outage_and_preserves_local_stage() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let mut meta_config = kiseki_meta::MetaConfig::default();
+        meta_config.with_dsn(&format!(
+            "rocksdb://:{}",
+            tempdir.path().join("meta").display()
+        ));
+        kiseki_meta::update_format(&meta_config.dsn, Format::default(), false).unwrap();
+        let meta = kiseki_meta::open(meta_config).unwrap();
+        let (inode, _) = meta
+            .create(
+                Arc::new(FuseContext::background()),
+                ROOT_INO,
+                "remote-policy-outage",
+                0o600,
+                0,
+                0,
+            )
+            .await
+            .unwrap();
+        let remote_dir = tempdir.path().join("remote");
+        std::fs::create_dir(&remote_dir).unwrap();
+        let cache_dir = tempdir.path().join("cache");
+        let vfs = KisekiVFS::new(
+            Config {
+                object_storage: ObjectStorageConfig::File {
+                    root: remote_dir.clone(),
+                },
+                cache_dir: cache_dir.clone(),
+                memory_page_capacity: ReadableSize(kiseki_common::PAGE_SIZE as u64),
+                shutdown_policy: crate::ShutdownPolicy::RemoteDurable,
+                ..Config::default()
+            },
+            meta,
+        )
+        .await
+        .unwrap();
+        let writer = vfs.data_manager.open_file_writer(inode, 0).unwrap();
+        writer
+            .write(0, b"local stage must survive a remote shutdown failure")
+            .await
+            .unwrap();
+        std::fs::remove_dir(&remote_dir).unwrap();
+        std::fs::write(&remote_dir, b"remote unavailable").unwrap();
+
+        let error = vfs.shutdown(Duration::from_secs(1)).await.unwrap_err();
+        assert_eq!(error.report.writers_total, 1);
+        assert_eq!(error.report.writers_flushed, 1);
+        assert_eq!(error.report.staged_pending_after, 1);
+        assert!(
+            error
+                .report
+                .errors
+                .iter()
+                .any(|error| error.contains("remote stage drain"))
+        );
+        assert_eq!(error.report.tasks.active, 0);
+        assert!(cache_dir.join("stage").read_dir().unwrap().next().is_some());
     }
 }

@@ -19,41 +19,14 @@ pub mod memory_pool;
 
 use std::{
     fmt::{Debug, Formatter},
-    sync::{Arc, LazyLock},
+    path::PathBuf,
+    sync::Arc,
 };
 
-use kiseki_common::PAGE_SIZE;
 use kiseki_utils::readable_size::ReadableSize;
 use tracing::debug;
 
-use crate::err::{InvalidPagePoolConfigSnafu, Result};
-
-pub static GLOBAL_HYBRID_PAGE_POOL: LazyLock<Arc<HybridPagePool>> = LazyLock::new(|| {
-    std::thread::spawn(|| {
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        runtime.handle().block_on(async {
-            // 根据环境变量决定是否启用disk pool
-            // 测试环境下默认只使用内存pool避免并发冲突
-            let builder = PagePoolBuilder::default()
-                .with_page_size(PAGE_SIZE)
-                .with_memory_capacity(1 << 30);
-
-            let builder = if cfg!(test) || std::env::var("KISEKI_DISABLE_DISK_POOL").is_ok() {
-                // 测试环境或明确禁用时，不使用disk pool
-                builder
-            } else {
-                // 生产环境使用disk pool
-                builder.with_disk_capacity(1 << 30)
-            };
-
-            Arc::new(builder.build().await.unwrap())
-        })
-    })
-    .join()
-    .unwrap()
-});
-
-const DEFAULT_DISK_PAGE_POOL_PATH: &str = "/tmp/kiseki.page_pool";
+use crate::err::{InvalidPagePoolConfigSnafu, MissingDiskPagePoolPathSnafu, Result};
 
 #[derive(Debug, Default)]
 pub struct PagePoolBuilder {
@@ -61,7 +34,7 @@ pub struct PagePoolBuilder {
     memory_capacity: usize,
     // disk page pool is optional
     disk_capacity:   Option<usize>,
-    disk_pool_path:  Option<String>,
+    disk_pool_path:  Option<PathBuf>,
 }
 
 impl PagePoolBuilder {
@@ -80,10 +53,13 @@ impl PagePoolBuilder {
         self
     }
 
-    #[allow(dead_code)] // only exercised by tests so far
-    pub fn with_disk_capacity_and_path(mut self, disk_capacity: usize, path: &str) -> Self {
+    pub fn with_disk_capacity_and_path(
+        mut self,
+        disk_capacity: usize,
+        path: impl Into<PathBuf>,
+    ) -> Self {
         self.disk_capacity = Some(disk_capacity);
-        self.disk_pool_path = Some(path.to_string());
+        self.disk_pool_path = Some(path.into());
         self
     }
 
@@ -91,19 +67,20 @@ impl PagePoolBuilder {
         validate_page_pool_config(self.page_size, self.memory_capacity)?;
         let mut total_page_cnt = self.memory_capacity / self.page_size;
         let memory_pool = memory_pool::MemoryPagePool::new(self.page_size, self.memory_capacity)?;
-        let (disk_pool, disk_capacity) = if let Some(disk_capacity) = self.disk_capacity {
-            validate_page_pool_config(self.page_size, disk_capacity)?;
-            total_page_cnt += disk_capacity / self.page_size;
-            let disk_pool_path = self
-                .disk_pool_path
-                .as_deref()
-                .unwrap_or(DEFAULT_DISK_PAGE_POOL_PATH);
-            let disk_pool =
-                disk_pool::DiskPagePool::new(disk_pool_path, self.page_size, disk_capacity).await?;
-            (Some(disk_pool), disk_capacity)
-        } else {
-            (None, 0)
-        };
+        let (disk_pool, disk_pool_path, disk_capacity) =
+            if let Some(disk_capacity) = self.disk_capacity {
+                validate_page_pool_config(self.page_size, disk_capacity)?;
+                total_page_cnt += disk_capacity / self.page_size;
+                let disk_pool_path = self
+                    .disk_pool_path
+                    .ok_or_else(|| MissingDiskPagePoolPathSnafu.build())?;
+                let disk_pool =
+                    disk_pool::DiskPagePool::new(&disk_pool_path, self.page_size, disk_capacity)
+                        .await?;
+                (Some(disk_pool), Some(disk_pool_path), disk_capacity)
+            } else {
+                (None, None, 0)
+            };
 
         Ok(HybridPagePool {
             page_size: self.page_size,
@@ -112,6 +89,7 @@ impl PagePoolBuilder {
             total_page_cnt,
             memory_pool,
             disk_pool,
+            disk_pool_path,
         })
     }
 }
@@ -134,6 +112,7 @@ pub struct HybridPagePool {
     page_size:       usize,
     memory_capacity: usize,
     disk_capacity:   usize,
+    disk_pool_path:  Option<PathBuf>,
     total_page_cnt:  usize,
 
     memory_pool: Arc<memory_pool::MemoryPagePool>,
@@ -149,7 +128,9 @@ impl Debug for HybridPagePool {
             ReadableSize(self.page_size as u64),
             ReadableSize(self.memory_capacity as u64),
             ReadableSize(self.disk_capacity as u64),
-            DEFAULT_DISK_PAGE_POOL_PATH,
+            self.disk_pool_path
+                .as_deref()
+                .map_or_else(|| "disabled".to_string(), |path| path.display().to_string()),
             self.remain(),
             self.total_page_cnt,
         )
@@ -251,6 +232,7 @@ impl Page {
 mod tests {
     use std::io::Cursor;
 
+    use kiseki_common::PAGE_SIZE;
     use kiseki_utils::logger::install_fmt_log;
     use tokio::time::Instant;
     use tracing::debug;
@@ -271,6 +253,15 @@ mod tests {
             PagePoolBuilder::default()
                 .with_page_size(PAGE_SIZE)
                 .with_memory_capacity(PAGE_SIZE + 1)
+                .build()
+                .await
+                .is_err()
+        );
+        assert!(
+            PagePoolBuilder::default()
+                .with_page_size(PAGE_SIZE)
+                .with_memory_capacity(PAGE_SIZE)
+                .with_disk_capacity(PAGE_SIZE)
                 .build()
                 .await
                 .is_err()

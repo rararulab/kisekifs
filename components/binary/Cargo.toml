@@ -7,7 +7,11 @@ edition.workspace = true
 
 [dependencies]
 fuser.workspace = true
-rustix = { workspace = true, features = ["mount"] }
+fs4.workspace = true
+humantime.workspace = true
+rustix = { workspace = true, features = ["fs", "mount"] }
+serde.workspace = true
+serde_json.workspace = true
 snafu.workspace = true
 tokio.workspace = true
 tracing.workspace = true
@@ -24,7 +28,7 @@ kiseki-vfs = { path = "../../components/vfs" }
 clap = { version = "4.5.47", features = ["derive"] }
 clap-num = "1.2.0"
 const_format = "0.2.34"
-ctrlc = "3.4.7"
+ctrlc = { version = "3.4.7", features = ["termination"] }
 human-panic = "1.2.3"
 regex = "1.11.2"
 
@@ -34,6 +38,9 @@ procfs = "0.16.0"
 [build-dependencies]
 built = { version = "0.8.1", features = ["git2"] }
 const_format = "0.2.34"
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

@@ -45,6 +45,15 @@ fn map_init_result<E: ToErrno>(result: std::result::Result<(), E>) -> Result<(),
     result.map_err(|error| error.to_errno())
 }
 
+macro_rules! begin_operation {
+    ($filesystem:expr, $reply:expr) => {
+        let Some(_operation_guard) = $filesystem.vfs.begin_operation() else {
+            $reply.error(libc::EIO);
+            return;
+        };
+    };
+}
+
 #[allow(clippy::too_many_arguments)]
 fn setattr_request_flags(
     mode: Option<u32>,
@@ -92,7 +101,7 @@ pub struct KisekiFuse {
 }
 
 impl KisekiFuse {
-    pub fn create(fuse_config: FuseConfig, vfs: KisekiVFS) -> Result<Self, Whatever> {
+    pub fn build_runtime(fuse_config: &FuseConfig) -> Result<runtime::Runtime, Whatever> {
         let runtime = runtime::Builder::new_multi_thread()
             .worker_threads(fuse_config.async_work_threads)
             .thread_name("kiseki-fuse-async-runtime")
@@ -104,11 +113,25 @@ impl KisekiFuse {
             "build tokio runtime with {} working threads",
             fuse_config.async_work_threads
         );
-        Ok(Self {
+        Ok(runtime)
+    }
+
+    /// Create the FUSE adapter with the runtime that initialized the VFS.
+    ///
+    /// Recovery workers are spawned while `KisekiVFS::new_checked` runs. The
+    /// same runtime therefore has to remain alive until the mounted session is
+    /// destroyed; replacing a short-lived startup runtime silently cancels
+    /// those workers.
+    pub const fn create(
+        fuse_config: FuseConfig,
+        vfs: Arc<KisekiVFS>,
+        runtime: runtime::Runtime,
+    ) -> Self {
+        Self {
             _config: fuse_config,
-            vfs: Arc::new(vfs),
+            vfs,
             runtime,
-        })
+        }
     }
 
     fn reply_entry(&self, ctx: &FuseContext, reply: ReplyEntry, mut entry: FullEntry) {
@@ -197,8 +220,19 @@ impl Filesystem for KisekiFuse {
         map_init_result(result)
     }
 
+    fn destroy(&mut self) {
+        match self
+            .runtime
+            .block_on(self.vfs.shutdown(self.vfs.config.shutdown_deadline))
+        {
+            Ok(report) => info!(?report, "FUSE destroy completed mount shutdown"),
+            Err(error) => error!(?error.report, "FUSE destroy observed an unclean shutdown"),
+        }
+    }
+
     #[instrument(level = "info", skip_all, fields(req = _req.unique(), ino = parent, name = ? name))]
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
+        begin_operation!(self, reply);
         let ctx = Arc::new(FuseContext::from(_req));
         let Some(name) = name.to_str() else {
             reply.error(libc::EINVAL);
@@ -230,6 +264,7 @@ impl Filesystem for KisekiFuse {
 
     #[instrument(level = "info", skip_all, fields(req = _req.unique(), ino = ino, name = field::Empty))]
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
+        begin_operation!(self, reply);
         match self
             .runtime
             .block_on(self.vfs.get_attr(Ino::from(ino)).in_current_span())
@@ -262,6 +297,7 @@ impl Filesystem for KisekiFuse {
         flags: Option<u32>,
         reply: ReplyAttr,
     ) {
+        begin_operation!(self, reply);
         let ctx = Arc::new(FuseContext::from(_req));
         let set_attr_flags =
             setattr_request_flags(mode, uid, gid, size, atime.as_ref(), mtime.as_ref(), flags);
@@ -289,6 +325,7 @@ impl Filesystem for KisekiFuse {
 
     /// Read symbolic link.
     fn readlink(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyData) {
+        begin_operation!(self, reply);
         let ctx = Arc::new(FuseContext::from(_req));
         match self
             .runtime
@@ -322,6 +359,7 @@ impl Filesystem for KisekiFuse {
         rdev: u32,
         reply: ReplyEntry,
     ) {
+        begin_operation!(self, reply);
         // mode_t is u32 on Linux but u16 on macOS, so cast it here
         let ctx = Arc::new(FuseContext::from(_req));
         let name = name.to_string_lossy().to_string();
@@ -346,6 +384,7 @@ impl Filesystem for KisekiFuse {
         umask: u32,
         reply: ReplyEntry,
     ) {
+        begin_operation!(self, reply);
         let ctx = Arc::new(FuseContext::from(_req));
         let name = name.to_string_lossy().to_string();
         match self.runtime.block_on(
@@ -359,6 +398,7 @@ impl Filesystem for KisekiFuse {
     }
 
     fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        begin_operation!(self, reply);
         let ctx = Arc::new(FuseContext::from(_req));
         let name = name.to_string_lossy();
         match self
@@ -372,6 +412,7 @@ impl Filesystem for KisekiFuse {
 
     #[instrument(level = "warn", skip_all, fields(req = _req.unique(), parent = parent, name = ? name))]
     fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        begin_operation!(self, reply);
         let ctx = Arc::new(FuseContext::from(_req));
         let name = name.to_string_lossy();
         match self
@@ -392,6 +433,7 @@ impl Filesystem for KisekiFuse {
         target: &Path,
         reply: ReplyEntry,
     ) {
+        begin_operation!(self, reply);
         let ctx = Arc::new(FuseContext::from(_req));
         let link_name = link_name.to_string_lossy();
         match self.runtime.block_on(
@@ -421,6 +463,7 @@ impl Filesystem for KisekiFuse {
         flags: u32,
         reply: ReplyEmpty,
     ) {
+        begin_operation!(self, reply);
         let ctx = Arc::new(FuseContext::from(req));
         let name = name.to_string_lossy();
         let newname = newname.to_string_lossy();
@@ -443,6 +486,7 @@ impl Filesystem for KisekiFuse {
         new_name: &OsStr,
         reply: ReplyEntry,
     ) {
+        begin_operation!(self, reply);
         let ctx = Arc::new(FuseContext::from(_req));
         let new_name = new_name.to_string_lossy();
         match self.runtime.block_on(
@@ -457,6 +501,7 @@ impl Filesystem for KisekiFuse {
 
     #[instrument(level = "warn", skip_all, fields(req = _req.unique(), ino = _ino, pid = _req.pid(), name = field::Empty))]
     fn open(&mut self, _req: &Request<'_>, _ino: u64, _flags: i32, reply: ReplyOpen) {
+        begin_operation!(self, reply);
         let ctx = FuseContext::from(_req);
         match self
             .runtime
@@ -479,6 +524,7 @@ impl Filesystem for KisekiFuse {
         lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
+        begin_operation!(self, reply);
         let ctx = Arc::new(FuseContext::from(_req));
         let mut bytes_read = 0;
         match self.runtime.block_on(
@@ -518,6 +564,7 @@ impl Filesystem for KisekiFuse {
         lock_owner: Option<u64>,
         reply: ReplyWrite,
     ) {
+        begin_operation!(self, reply);
         let ctx = Arc::new(FuseContext::from(_req));
         match self.runtime.block_on(
             self.vfs
@@ -542,6 +589,7 @@ impl Filesystem for KisekiFuse {
 
     #[instrument(level = "info", skip_all, fields(req = req.unique(), ino = ino, fh = fh, pid = req.pid(), name = field::Empty))]
     fn flush(&mut self, req: &Request<'_>, ino: u64, fh: u64, lock_owner: u64, reply: ReplyEmpty) {
+        begin_operation!(self, reply);
         let ctx = Arc::new(FuseContext::from(req));
         match self.runtime.block_on(
             self.vfs
@@ -564,6 +612,7 @@ impl Filesystem for KisekiFuse {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
+        begin_operation!(self, reply);
         let ctx = Arc::new(FuseContext::from(req));
         match self
             .runtime
@@ -576,6 +625,7 @@ impl Filesystem for KisekiFuse {
 
     #[instrument(level = "info", skip_all, fields(req = _req.unique(), ino = ino, fh = fh, datasync = datasync, name = field::Empty))]
     fn fsync(&mut self, _req: &Request<'_>, ino: u64, fh: u64, datasync: bool, _reply: ReplyEmpty) {
+        begin_operation!(self, _reply);
         let ctx = Arc::new(FuseContext::from(_req));
         match self.runtime.block_on(
             self.vfs
@@ -589,6 +639,7 @@ impl Filesystem for KisekiFuse {
 
     #[instrument(level = "info", skip_all, fields(req = _req.unique(), ino = ino, flags = flags, name = field::Empty))]
     fn opendir(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
+        begin_operation!(self, reply);
         let ctx = FuseContext::from(_req);
         match self
             .runtime
@@ -608,6 +659,7 @@ impl Filesystem for KisekiFuse {
         offset: i64,
         mut reply: ReplyDirectory,
     ) {
+        begin_operation!(self, reply);
         let ctx = FuseContext::from(_req);
         let entries = match self.runtime.block_on(
             self.vfs
@@ -646,6 +698,7 @@ impl Filesystem for KisekiFuse {
         offset: i64,
         mut reply: ReplyDirectoryPlus,
     ) {
+        begin_operation!(self, reply);
         let ctx = FuseContext::from(_req);
         let entries = match self.runtime.block_on(
             self.vfs
@@ -688,6 +741,7 @@ impl Filesystem for KisekiFuse {
         _flags: i32,
         reply: ReplyEmpty,
     ) {
+        begin_operation!(self, reply);
         match self
             .runtime
             .block_on(self.vfs.release_dir(Ino(ino), fh).in_current_span())
@@ -699,6 +753,7 @@ impl Filesystem for KisekiFuse {
 
     #[instrument(level = "info", skip_all, fields(req = _req.unique(), ino = _ino, name = field::Empty))]
     fn statfs(&mut self, _req: &Request<'_>, _ino: u64, reply: ReplyStatfs) {
+        begin_operation!(self, reply);
         // 	http://man.he.net/man2/statfs
         // struct statfs {
         // __fsword_t f_type;    // Type of filesystem (see below)
@@ -760,6 +815,7 @@ impl Filesystem for KisekiFuse {
         flags: i32,
         reply: ReplyCreate,
     ) {
+        begin_operation!(self, reply);
         let ctx = Arc::new(FuseContext::from(_req));
         let name = name.to_string_lossy().to_string();
 
@@ -790,6 +846,7 @@ impl Filesystem for KisekiFuse {
         mode: i32,
         reply: ReplyEmpty,
     ) {
+        begin_operation!(self, reply);
         let ctx = Arc::new(FuseContext::from(req));
         match self.runtime.block_on(
             self.vfs

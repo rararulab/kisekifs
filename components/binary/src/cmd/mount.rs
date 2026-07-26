@@ -15,18 +15,30 @@
 use std::{
     convert::Infallible,
     fmt::{Debug, Formatter},
+    fs::{File, OpenOptions},
+    io::Write,
     path::{Path, PathBuf},
     str::FromStr,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use clap::{ArgAction, Args};
+use fs4::FileExt;
 use fuser::MountOption;
 use kiseki_common::KISEKI;
 use kiseki_fuse::{FuseConfig, null};
 use kiseki_meta::MetaConfig;
-use kiseki_utils::{logger::LoggingOptions, object_storage::ObjectStorageConfig};
-use kiseki_vfs::{Config as VFSConfig, KisekiVFS};
-use snafu::{ResultExt, Whatever, whatever};
+use kiseki_utils::{
+    logger::LoggingOptions, object_storage::ObjectStorageConfig, readable_size::ReadableSize,
+};
+use kiseki_vfs::{Config as VFSConfig, KisekiVFS, LifecycleState, ShutdownPolicy};
+use serde::{Deserialize, Serialize};
+use snafu::{OptionExt, ResultExt, Whatever, whatever};
 use tracing::info;
 
 use crate::build_info;
@@ -36,6 +48,17 @@ const LOGGING_OPTIONS_HEADER: &str = "Logging options";
 const META_OPTIONS_HEADER: &str = "Meta options";
 const STORAGE_OPTIONS_HEADER: &str = "Object storage options";
 const CACHE_OPTIONS_HEADER: &str = "Cache options";
+const MOUNT_READY_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn parse_positive_usize(value: &str) -> Result<usize, String> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|error| format!("expected a positive integer: {error}"))?;
+    if parsed == 0 {
+        return Err("value must be greater than zero".to_string());
+    }
+    Ok(parsed)
+}
 
 #[derive(Clone)]
 pub struct ObjectStorageDsn(String);
@@ -51,6 +74,317 @@ impl FromStr for ObjectStorageDsn {
 
     fn from_str(dsn: &str) -> Result<Self, Self::Err> { Ok(Self(dsn.to_string())) }
 }
+
+#[derive(Debug, Deserialize, Serialize)]
+struct ReadyFilePayload {
+    version:     String,
+    pid:         u32,
+    token:       String,
+    mount_point: String,
+    volume:      String,
+    state:       String,
+}
+
+struct ReadyFileGuard {
+    path:     PathBuf,
+    pid:      u32,
+    token:    String,
+    identity: ReadyFileIdentity,
+    _lease:   File,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ReadyFileIdentity {
+    device: u64,
+    inode:  u64,
+}
+
+#[cfg(not(unix))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ReadyFileIdentity {
+    length:   u64,
+    modified: Option<SystemTime>,
+}
+
+impl ReadyFileGuard {
+    fn create(path: PathBuf, mount_point: &Path, volume: &str) -> Result<Self, Whatever> {
+        if !path.is_absolute() {
+            whatever!("ready file path must be absolute");
+        }
+        let parent = path
+            .parent()
+            .with_whatever_context(|| "ready file has no parent directory".to_string())?;
+        if !parent.is_dir() {
+            whatever!("ready file parent {} is not a directory", parent.display());
+        }
+
+        let pid = std::process::id();
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let token = format!("{pid}-{timestamp}");
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .with_whatever_context(|| "ready file name must be valid UTF-8".to_string())?;
+        let lease_path = parent.join(format!(".{file_name}.lock"));
+        let lease = acquire_ready_file_lease(&lease_path).with_whatever_context(|error| {
+            format!(
+                "failed to acquire ready file lease {}: {error}",
+                lease_path.display()
+            )
+        })?;
+        let temp_path = parent.join(format!(".{file_name}.tmp-{token}"));
+        let payload = ReadyFilePayload {
+            version: build_info::PKG_VERSION.to_string(),
+            pid,
+            token: token.clone(),
+            mount_point: mount_point.display().to_string(),
+            volume: volume.to_string(),
+            state: "ready".to_string(),
+        };
+        let bytes = serde_json::to_vec(&payload)
+            .with_whatever_context(|error| format!("failed to serialize ready file: {error}"))?;
+
+        let publish_result = (|| -> std::io::Result<()> {
+            let mut file = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&temp_path)?;
+            file.write_all(&bytes)?;
+            file.write_all(b"\n")?;
+            file.sync_all()?;
+            match std::fs::hard_link(&temp_path, &path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    reclaim_stale_ready_file(&path)?;
+                    std::fs::hard_link(&temp_path, &path)?;
+                }
+                Err(error) => return Err(error),
+            }
+            Ok(())
+        })();
+        let _ = std::fs::remove_file(&temp_path);
+        publish_result.with_whatever_context(|error| {
+            format!(
+                "failed to atomically publish ready file {}: {error}",
+                path.display()
+            )
+        })?;
+
+        let identity = ready_file_identity(&path).with_whatever_context(|error| {
+            format!(
+                "failed to identify published ready file {}: {error}",
+                path.display()
+            )
+        })?;
+
+        Ok(Self {
+            path,
+            pid,
+            token,
+            identity,
+            _lease: lease,
+        })
+    }
+
+    fn remove_if_owned(&self) { self.remove_if_owned_after_retirement(|| {}); }
+
+    fn remove_if_owned_after_retirement(&self, after_retirement: impl FnOnce()) {
+        let Ok(retired) = retire_ready_file(&self.path) else {
+            return;
+        };
+        after_retirement();
+        let owned = ready_file_identity(&retired).ok() == Some(self.identity)
+            && std::fs::read(&retired)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<ReadyFilePayload>(&bytes).ok())
+                .is_some_and(|payload| payload.pid == self.pid && payload.token == self.token);
+        if owned {
+            let _ = std::fs::remove_file(&retired);
+        } else if let Err(error) = restore_retired_ready_file(&retired, &self.path) {
+            tracing::warn!(
+                retired = %retired.display(),
+                path = %self.path.display(),
+                %error,
+                "preserved a concurrently replaced ready record under its retirement name"
+            );
+        }
+    }
+}
+
+fn retire_ready_file(path: &Path) -> std::io::Result<PathBuf> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "ready path has no parent")
+    })?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "ready file name must be valid UTF-8",
+            )
+        })?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let retired = parent.join(format!(".{name}.retired-{}-{nonce}", std::process::id()));
+    rename_ready_file_no_replace(path, &retired)?;
+    Ok(retired)
+}
+
+fn restore_retired_ready_file(retired: &Path, path: &Path) -> std::io::Result<()> {
+    rename_ready_file_no_replace(retired, path)
+}
+
+#[cfg(target_os = "linux")]
+fn rename_ready_file_no_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
+    rustix::fs::renameat_with(
+        rustix::fs::CWD,
+        source,
+        rustix::fs::CWD,
+        destination,
+        rustix::fs::RenameFlags::NOREPLACE,
+    )
+    .map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn rename_ready_file_no_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
+    if destination.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "ready destination already exists",
+        ));
+    }
+    std::fs::rename(source, destination)
+}
+
+fn acquire_ready_file_lease(path: &Path) -> std::io::Result<File> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            #[cfg(unix)]
+            let unshared = {
+                use std::os::unix::fs::MetadataExt;
+                metadata.nlink() == 1
+            };
+            #[cfg(not(unix))]
+            let unshared = true;
+            if !metadata.is_file() || metadata.file_type().is_symlink() || !unshared {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "ready file lease must be an unshared regular file, not a symlink",
+                ));
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let lease = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)?;
+    FileExt::try_lock_exclusive(&lease)?;
+    Ok(lease)
+}
+
+#[cfg(unix)]
+fn ready_file_identity(path: &Path) -> std::io::Result<ReadyFileIdentity> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "ready path is not a regular file",
+        ));
+    }
+    Ok(ReadyFileIdentity {
+        device: metadata.dev(),
+        inode:  metadata.ino(),
+    })
+}
+
+#[cfg(not(unix))]
+fn ready_file_identity(path: &Path) -> std::io::Result<ReadyFileIdentity> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "ready path is not a regular file",
+        ));
+    }
+    Ok(ReadyFileIdentity {
+        length:   metadata.len(),
+        modified: metadata.modified().ok(),
+    })
+}
+
+impl Drop for ReadyFileGuard {
+    fn drop(&mut self) { self.remove_if_owned() }
+}
+
+fn reclaim_stale_ready_file(path: &Path) -> std::io::Result<()> {
+    reclaim_stale_ready_file_after_retirement(path, || {})
+}
+
+fn reclaim_stale_ready_file_after_retirement(
+    path: &Path,
+    after_retirement: impl FnOnce(),
+) -> std::io::Result<()> {
+    let retired = retire_ready_file(path)?;
+    after_retirement();
+    // Inspect the file type without following links before any blocking read.
+    // Unknown entries (symlink, FIFO, directory, device) are restored and
+    // rejected rather than interpreted as KisekiFS ownership records.
+    let reclaimable = ready_file_identity(&retired).is_ok()
+        && std::fs::read(&retired)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<ReadyFilePayload>(&bytes).ok())
+            .is_some_and(|payload| {
+                payload.pid != 0
+                    && !payload.token.is_empty()
+                    && !payload.mount_point.is_empty()
+                    && !payload.volume.is_empty()
+                    && payload.state == "ready"
+                    && ready_file_owner_is_dead(payload.pid)
+            });
+    if reclaimable {
+        return std::fs::remove_file(retired);
+    }
+
+    let restore_error = restore_retired_ready_file(&retired, path).err();
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        restore_error.map_or_else(
+            || "ready file owner is live, malformed, or unverifiable".to_string(),
+            |error| {
+                format!(
+                    "ready file owner is live, malformed, or unverifiable; the captured record \
+                     was preserved at {} because its public path is occupied: {error}",
+                    retired.display()
+                )
+            },
+        ),
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn ready_file_owner_is_dead(pid: u32) -> bool {
+    match std::fs::metadata(format!("/proc/{pid}")) {
+        Ok(_) => false,
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn ready_file_owner_is_dead(_pid: u32) -> bool { false }
 
 #[derive(Debug, Clone, Args)]
 #[command(flatten_help = true)]
@@ -104,6 +438,7 @@ pub struct MountArgs {
     help = "Number of threads to use for tokio async runtime",
     help_heading = MOUNT_OPTIONS_HEADER,
     default_value = "10",
+    value_parser = parse_positive_usize,
     )]
     pub async_work_threads: usize,
 
@@ -199,11 +534,83 @@ pub struct MountArgs {
     #[arg(
         long,
         value_name = "DIRECTORY",
-        help = "Directory for restart-recoverable staged blocks",
+        help = "Mount-specific root for page, read, and restart-recoverable stage caches",
         help_heading = CACHE_OPTIONS_HEADER,
-        default_value = kiseki_common::KISEKI_DEBUG_STAGE_CACHE,
+        required = true,
     )]
-    pub stage_cache_dir: PathBuf,
+    pub cache_dir: PathBuf,
+
+    #[arg(
+        long,
+        value_name = "SIZE",
+        help = "In-memory page pool capacity",
+        help_heading = CACHE_OPTIONS_HEADER,
+        default_value = "300MiB",
+    )]
+    pub memory_page_capacity: ReadableSize,
+
+    #[arg(
+        long,
+        value_name = "SIZE",
+        help = "Optional disk-backed page spill capacity",
+        help_heading = CACHE_OPTIONS_HEADER,
+    )]
+    pub disk_page_capacity: Option<ReadableSize>,
+
+    #[arg(
+        long,
+        value_name = "SIZE",
+        help = "Maximum restart-recoverable stage cache size",
+        help_heading = CACHE_OPTIONS_HEADER,
+        default_value = "10GiB",
+    )]
+    pub stage_cache_capacity: ReadableSize,
+
+    #[arg(
+        long,
+        value_name = "DURATION",
+        help = "Time before a staged block is scheduled for remote migration",
+        help_heading = CACHE_OPTIONS_HEADER,
+        default_value = "24h",
+        value_parser = humantime::parse_duration,
+    )]
+    pub stage_cache_ttl: Duration,
+
+    #[arg(
+        long,
+        value_name = "SIZE",
+        help = "In-memory read cache capacity",
+        help_heading = CACHE_OPTIONS_HEADER,
+        default_value = "1GiB",
+    )]
+    pub memory_read_cache_capacity: ReadableSize,
+
+    #[arg(
+        long,
+        value_name = "DURATION",
+        help = "Maximum graceful shutdown duration",
+        help_heading = MOUNT_OPTIONS_HEADER,
+        default_value = "30s",
+        value_parser = humantime::parse_duration,
+    )]
+    pub shutdown_deadline: Duration,
+
+    #[arg(
+        long,
+        value_name = "POLICY",
+        help = "Shutdown durability boundary: local or remote",
+        help_heading = MOUNT_OPTIONS_HEADER,
+        default_value = "local",
+    )]
+    pub shutdown_policy: ShutdownPolicy,
+
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Atomically publish mount readiness to this file",
+        help_heading = MOUNT_OPTIONS_HEADER,
+    )]
+    pub ready_file: Option<PathBuf>,
 }
 
 impl MountArgs {
@@ -267,11 +674,22 @@ impl MountArgs {
         if matches!(object_storage, ObjectStorageConfig::Memory) {
             whatever!("memory object storage is available only in tests");
         }
-        Ok(VFSConfig {
+        let config = VFSConfig {
             object_storage,
-            stage_cache_dir: self.stage_cache_dir.clone(),
+            cache_dir: self.cache_dir.clone(),
+            memory_page_capacity: self.memory_page_capacity,
+            disk_page_capacity: self.disk_page_capacity,
+            stage_cache_capacity: self.stage_cache_capacity,
+            stage_cache_ttl: self.stage_cache_ttl,
+            memory_read_cache_capacity: self.memory_read_cache_capacity,
+            shutdown_deadline: self.shutdown_deadline,
+            shutdown_policy: self.shutdown_policy,
             ..VFSConfig::default()
-        })
+        };
+        config
+            .validate_mount_paths(&self.mount_point, self.ready_file.as_deref())
+            .with_whatever_context(|error| format!("invalid mount cache configuration: {error}"))?;
+        Ok(config)
     }
 
     pub fn run(self) -> Result<(), Whatever> {
@@ -284,11 +702,9 @@ impl MountArgs {
         kiseki_utils::panic_hook::set_panic_hook();
 
         if self.foreground {
-            let (_guard, _sentry_guard) = if let Some(opts) = self.load_logging_opts() {
+            let logging_guard = self.load_logging_opts().map(|opts| {
                 kiseki_utils::logger::init_global_logging_without_runtime("kiseki-fuse", &opts)
-            } else {
-                (vec![], None)
-            };
+            });
 
             let pyroscope_guard = kiseki_utils::pyroscope_init::init_pyroscope()?;
 
@@ -302,6 +718,9 @@ impl MountArgs {
 
                 // Shutdown the Agent
                 agent_ready.shutdown();
+            }
+            if let Some(logging_guard) = logging_guard {
+                logging_guard.shutdown(Duration::from_secs(2));
             }
         }
         Ok(())
@@ -326,34 +745,209 @@ fn mount(args: MountArgs) -> Result<(), Whatever> {
     info!("try to mount kiseki on {:?}", &args.mount_point);
     print_versions();
 
+    // Signals are process-scoped, so install the handler before storage
+    // probing or recovery begins. Startup polls the same latch as the mounted
+    // session and can be cancelled without publishing readiness.
+    let shutdown_requested = Arc::new(AtomicBool::new(false));
+    let signal_latch = shutdown_requested.clone();
+    ctrlc::set_handler(move || {
+        signal_latch.store(true, Ordering::Release);
+    })
+    .with_whatever_context(|error| format!("failed to install signal handler: {error}"))?;
+
     let fuse_config = args.fuse_config();
     let meta_config = args.meta_config()?;
     let vfs_config = args.vfs_config()?;
+    let ready_file_path = args.ready_file.clone();
 
     validate_mount_point(&args.mount_point)?;
 
+    if shutdown_requested.load(Ordering::Acquire) {
+        return Ok(());
+    }
+
     let meta = kiseki_meta::open(meta_config)
         .with_whatever_context(|e| format!("failed to open meta, {e:?}"))?;
-    let startup_runtime = tokio::runtime::Builder::new_current_thread()
+    let fuse_runtime = kiseki_fuse::KisekiFuse::build_runtime(&fuse_config)?;
+    let shutdown_runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .with_whatever_context(|error| format!("failed to build startup runtime: {error}"))?;
-    let file_system = startup_runtime
-        .block_on(KisekiVFS::new_checked(vfs_config, meta))
-        .with_whatever_context(|e| format!("failed to create file system, {e:?}"))?;
-    drop(startup_runtime);
+        .with_whatever_context(|error| format!("failed to build shutdown runtime: {error}"))?;
+    let startup_signal = shutdown_requested.clone();
+    let file_system = match fuse_runtime.block_on(async {
+        tokio::select! {
+            result = KisekiVFS::new_checked(vfs_config, meta) => Some(result),
+            () = wait_for_shutdown_request(startup_signal) => None,
+        }
+    }) {
+        Some(result) => Arc::new(
+            result.with_whatever_context(|e| format!("failed to create file system, {e:?}"))?,
+        ),
+        None => return Ok(()),
+    };
 
-    let fs = kiseki_fuse::KisekiFuse::create(fuse_config.clone(), file_system)?;
-    fuser::mount2(fs, &args.mount_point, &fuse_config.mount_options).with_whatever_context(
-        |e| {
-            format!(
-                "failed to mount kiseki on {}; {}",
-                args.mount_point.display(),
-                e
-            )
-        },
-    )?;
+    // Build all remaining process-level shutdown primitives before the FUSE
+    // session owns a live kernel mount. The FUSE runtime above is deliberately
+    // retained: recovery workers were spawned onto it during VFS startup.
+    if shutdown_requested.load(Ordering::Acquire) {
+        let result =
+            fuse_runtime.block_on(file_system.shutdown(file_system.config.shutdown_deadline));
+        result.with_whatever_context(|error| {
+            format!("mount startup cancellation failed to drain cleanly: {error}")
+        })?;
+        return Ok(());
+    }
+
+    let fs =
+        kiseki_fuse::KisekiFuse::create(fuse_config.clone(), file_system.clone(), fuse_runtime);
+    let mut session = match fuser::Session::new(fs, &args.mount_point, &fuse_config.mount_options) {
+        Ok(session) => session,
+        Err(error) => {
+            let shutdown = shutdown_runtime
+                .block_on(file_system.shutdown(file_system.config.shutdown_deadline));
+            if let Err(shutdown_error) = shutdown {
+                whatever!(
+                    "failed to mount kiseki on {}; {error}; cleanup failed: {shutdown_error}",
+                    args.mount_point.display()
+                );
+            }
+            whatever!(
+                "failed to mount kiseki on {}; {error}",
+                args.mount_point.display()
+            );
+        }
+    };
+    let mut unmounter = session.unmount_callable();
+    let session_guard = match thread::Builder::new()
+        .name("kiseki-fuse-session".to_string())
+        .spawn(move || session.run())
+    {
+        Ok(session_guard) => session_guard,
+        Err(error) => {
+            let shutdown = shutdown_runtime
+                .block_on(file_system.shutdown(file_system.config.shutdown_deadline));
+            let suffix = shutdown
+                .err()
+                .map(|error| format!("; cleanup failed: {error}"))
+                .unwrap_or_default();
+            whatever!("failed to start FUSE session thread: {error}{suffix}");
+        }
+    };
+
+    let startup_deadline = Instant::now() + MOUNT_READY_TIMEOUT;
+    let mut received_signal = false;
+    let mut startup_error = None;
+    loop {
+        if file_system.lifecycle_state() == LifecycleState::Ready
+            && std::fs::metadata(&args.mount_point).is_ok()
+        {
+            break;
+        }
+        if file_system.lifecycle_state() == LifecycleState::Failed {
+            startup_error = Some("filesystem initialization failed before readiness".to_string());
+            break;
+        }
+        if session_guard.is_finished() {
+            startup_error = Some("FUSE session exited before readiness".to_string());
+            break;
+        }
+        if shutdown_requested.load(Ordering::Acquire) {
+            received_signal = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(25));
+        if Instant::now() >= startup_deadline {
+            startup_error = Some("timed out waiting for truthful mount readiness".to_string());
+            break;
+        }
+    }
+
+    let ready_file = if !received_signal && startup_error.is_none() {
+        match ready_file_path {
+            Some(path) => {
+                match ReadyFileGuard::create(path, &args.mount_point, file_system.volume_name()) {
+                    Ok(guard) => Some(guard),
+                    Err(error) => {
+                        startup_error = Some(error.to_string());
+                        None
+                    }
+                }
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+
+    if !received_signal && startup_error.is_none() {
+        loop {
+            if session_guard.is_finished() {
+                break;
+            }
+            if shutdown_requested.load(Ordering::Acquire) {
+                received_signal = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    let termination_deadline = Instant::now() + file_system.config.shutdown_deadline;
+    drop(ready_file);
+    let should_unmount = received_signal || startup_error.is_some();
+    let initiated_shutdown = should_unmount.then(|| {
+        shutdown_runtime.block_on(file_system.shutdown(file_system.config.shutdown_deadline))
+    });
+    let unmount_error = should_unmount.then(|| unmounter.unmount().err()).flatten();
+
+    let session_error = join_session_until(session_guard, termination_deadline);
+    let shutdown_result = initiated_shutdown.unwrap_or_else(|| {
+        shutdown_runtime.block_on(file_system.shutdown(file_system.config.shutdown_deadline))
+    });
+
+    let mut terminal_errors = Vec::new();
+    if let Some(error) = startup_error {
+        terminal_errors.push(format!("mount startup failed: {error}"));
+    }
+    if let Some(error) = unmount_error {
+        terminal_errors.push(format!("failed to unmount during shutdown: {error}"));
+    }
+    if let Some(error) = session_error {
+        terminal_errors.push(error);
+    }
+    if let Err(error) = shutdown_result {
+        terminal_errors.push(format!("mount shutdown failed: {error}"));
+    }
+    if !terminal_errors.is_empty() {
+        whatever!(
+            "mount terminated with errors: {}",
+            terminal_errors.join("; ")
+        );
+    }
     Ok(())
+}
+
+async fn wait_for_shutdown_request(requested: Arc<AtomicBool>) {
+    while !requested.load(Ordering::Acquire) {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+fn join_session_until(
+    session: thread::JoinHandle<std::io::Result<()>>,
+    deadline: Instant,
+) -> Option<String> {
+    while !session.is_finished() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    if !session.is_finished() {
+        return Some("FUSE session did not exit before the shutdown deadline".to_string());
+    }
+    match session.join() {
+        Ok(Ok(())) => None,
+        Ok(Err(error)) => Some(format!("FUSE session failed: {error}")),
+        Err(_) => Some("FUSE session thread panicked".to_string()),
+    }
 }
 
 fn validate_mount_point(path: impl AsRef<Path>) -> Result<(), Whatever> {
@@ -413,6 +1007,8 @@ mod tests {
             "test",
             "--object-storage",
             "s3://volume-bucket/tenant/volume?region=test-region",
+            "--cache-dir",
+            "/tmp/kiseki-cli-test-cache",
             "/tmp/kiseki",
         ])
         .expect("parse mount arguments");
@@ -436,14 +1032,22 @@ mod tests {
             "test",
             "--object-storage",
             "file://relative/path",
+            "--cache-dir",
+            "/tmp/kiseki-cli-test-cache",
             "/tmp/kiseki",
         ])
         .unwrap();
         assert!(invalid.mount.vfs_config().is_err());
 
-        let memory =
-            TestCli::try_parse_from(["test", "--object-storage", "memory://", "/tmp/kiseki"])
-                .unwrap();
+        let memory = TestCli::try_parse_from([
+            "test",
+            "--object-storage",
+            "memory://",
+            "--cache-dir",
+            "/tmp/kiseki-cli-test-cache",
+            "/tmp/kiseki",
+        ])
+        .unwrap();
         assert!(memory.mount.vfs_config().is_err());
     }
 
@@ -451,8 +1055,15 @@ mod tests {
     fn mount_argument_debug_never_contains_storage_dsn_values() {
         let secret_marker = "do-not-echo-this-value";
         let dsn = format!("s3://user:{secret_marker}@volume-bucket/prefix");
-        let cli =
-            TestCli::try_parse_from(["test", "--object-storage", &dsn, "/tmp/kiseki"]).unwrap();
+        let cli = TestCli::try_parse_from([
+            "test",
+            "--object-storage",
+            &dsn,
+            "--cache-dir",
+            "/tmp/kiseki-cli-test-cache",
+            "/tmp/kiseki",
+        ])
+        .unwrap();
 
         assert!(!format!("{:?}", cli.mount).contains(secret_marker));
         let error = cli.mount.vfs_config().unwrap_err();
@@ -469,8 +1080,8 @@ mod tests {
             "file:///tmp/kiseki-objects",
             "--allow-other",
             "false",
-            "--stage-cache-dir",
-            "/tmp/kiseki-stage-isolated",
+            "--cache-dir",
+            "/tmp/kiseki-cache-isolated",
             "/tmp/kiseki",
         ])
         .expect("parse isolated mount arguments");
@@ -478,8 +1089,263 @@ mod tests {
         assert!(!cli.mount.auto_unmount);
         assert!(!cli.mount.allow_other);
         assert_eq!(
-            cli.mount.vfs_config().unwrap().stage_cache_dir,
-            PathBuf::from("/tmp/kiseki-stage-isolated")
+            cli.mount.vfs_config().unwrap().cache_dir,
+            PathBuf::from("/tmp/kiseki-cache-isolated")
         );
+    }
+
+    #[test]
+    fn cache_limits_are_readable_and_rejected_before_mounting_when_invalid() {
+        let cli = TestCli::try_parse_from([
+            "test",
+            "--object-storage",
+            "file:///tmp/kiseki-objects",
+            "--cache-dir",
+            "/tmp/kiseki-resource-test-cache",
+            "--memory-page-capacity",
+            "8MiB",
+            "--disk-page-capacity",
+            "16MiB",
+            "--stage-cache-capacity",
+            "32MiB",
+            "--stage-cache-ttl",
+            "5m",
+            "--memory-read-cache-capacity",
+            "4MiB",
+            "--shutdown-deadline",
+            "7s",
+            "/tmp/kiseki",
+        ])
+        .unwrap();
+        let config = cli.mount.vfs_config().unwrap();
+        assert_eq!(config.memory_page_capacity, ReadableSize::mb(8));
+        assert_eq!(config.disk_page_capacity, Some(ReadableSize::mb(16)));
+        assert_eq!(config.stage_cache_capacity, ReadableSize::mb(32));
+        assert_eq!(config.stage_cache_ttl, Duration::from_secs(300));
+        assert_eq!(config.shutdown_deadline, Duration::from_secs(7));
+
+        let invalid = TestCli::try_parse_from([
+            "test",
+            "--object-storage",
+            "file:///tmp/kiseki-objects",
+            "--cache-dir",
+            "/tmp/kiseki-resource-test-cache",
+            "--memory-page-capacity",
+            "1B",
+            "/tmp/kiseki",
+        ])
+        .unwrap();
+        assert!(invalid.mount.vfs_config().is_err());
+
+        let overlapping = TestCli::try_parse_from([
+            "test",
+            "--object-storage",
+            "file:///tmp/kiseki-objects",
+            "--cache-dir",
+            "/tmp/kiseki/cache",
+            "/tmp/kiseki",
+        ])
+        .unwrap();
+        assert!(overlapping.mount.vfs_config().is_err());
+
+        assert!(
+            TestCli::try_parse_from([
+                "test",
+                "--object-storage",
+                "file:///tmp/kiseki-objects",
+                "--cache-dir",
+                "/tmp/kiseki-resource-test-cache",
+                "--async-work-threads",
+                "0",
+                "/tmp/kiseki",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn ready_file_cleanup_removes_only_the_publishers_token() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let mount_point = tempdir.path().join("mount");
+        std::fs::create_dir(&mount_point).unwrap();
+        let ready_path = tempdir.path().join("ready.json");
+
+        let guard = ReadyFileGuard::create(ready_path.clone(), &mount_point, "volume").unwrap();
+        let payload: ReadyFilePayload =
+            serde_json::from_slice(&std::fs::read(&ready_path).unwrap()).unwrap();
+        assert_eq!(payload.pid, std::process::id());
+        assert_eq!(payload.state, "ready");
+        drop(guard);
+        assert!(!ready_path.exists());
+
+        let guard = ReadyFileGuard::create(ready_path.clone(), &mount_point, "volume").unwrap();
+        std::fs::write(&ready_path, b"foreign replacement").unwrap();
+        drop(guard);
+        assert_eq!(std::fs::read(&ready_path).unwrap(), b"foreign replacement");
+    }
+
+    #[test]
+    fn ready_file_cleanup_never_unlinks_a_replacement_published_during_retirement() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let mount_point = tempdir.path().join("mount");
+        std::fs::create_dir(&mount_point).unwrap();
+        let ready_path = tempdir.path().join("ready.json");
+        let guard = ReadyFileGuard::create(ready_path.clone(), &mount_point, "volume").unwrap();
+
+        guard.remove_if_owned_after_retirement(|| {
+            std::fs::write(&ready_path, b"concurrent replacement").unwrap();
+        });
+        assert_eq!(
+            std::fs::read(&ready_path).unwrap(),
+            b"concurrent replacement"
+        );
+        drop(guard);
+        assert_eq!(
+            std::fs::read(&ready_path).unwrap(),
+            b"concurrent replacement"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ready_file_cleanup_restores_an_unknown_symlink_without_following_it() {
+        use std::os::unix::fs::symlink;
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let mount_point = tempdir.path().join("mount");
+        std::fs::create_dir(&mount_point).unwrap();
+        let ready_path = tempdir.path().join("ready.json");
+        let target_path = tempdir.path().join("foreign-target");
+        std::fs::write(&target_path, b"foreign").unwrap();
+        let guard = ReadyFileGuard::create(ready_path.clone(), &mount_point, "volume").unwrap();
+        std::fs::remove_file(&ready_path).unwrap();
+        symlink(&target_path, &ready_path).unwrap();
+
+        drop(guard);
+        assert_eq!(std::fs::read_link(&ready_path).unwrap(), target_path);
+        assert_eq!(std::fs::read(&target_path).unwrap(), b"foreign");
+    }
+
+    #[test]
+    fn ready_file_lease_prevents_a_second_publisher_even_if_record_is_removed() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let mount_point = tempdir.path().join("mount");
+        std::fs::create_dir(&mount_point).unwrap();
+        let ready_path = tempdir.path().join("ready.json");
+
+        let guard = ReadyFileGuard::create(ready_path.clone(), &mount_point, "volume").unwrap();
+        std::fs::remove_file(&ready_path).unwrap();
+        assert!(ReadyFileGuard::create(ready_path.clone(), &mount_point, "volume").is_err());
+        drop(guard);
+        let replacement =
+            ReadyFileGuard::create(ready_path.clone(), &mount_point, "volume").unwrap();
+        drop(replacement);
+        assert!(!ready_path.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ready_file_reclaims_only_a_well_formed_dead_process_record() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let mount_point = tempdir.path().join("mount");
+        std::fs::create_dir(&mount_point).unwrap();
+        let ready_path = tempdir.path().join("ready.json");
+        let stale = ReadyFilePayload {
+            version:     "stale".to_string(),
+            pid:         u32::MAX,
+            token:       "dead-owner".to_string(),
+            mount_point: mount_point.display().to_string(),
+            volume:      "stale-volume".to_string(),
+            state:       "ready".to_string(),
+        };
+        std::fs::write(&ready_path, serde_json::to_vec(&stale).unwrap()).unwrap();
+
+        let guard = ReadyFileGuard::create(ready_path.clone(), &mount_point, "volume").unwrap();
+        let current: ReadyFilePayload =
+            serde_json::from_slice(&std::fs::read(&ready_path).unwrap()).unwrap();
+        assert_eq!(current.pid, std::process::id());
+        assert_ne!(current.token, stale.token);
+        drop(guard);
+        assert!(!ready_path.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stale_reclaim_never_unlinks_a_concurrent_replacement() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let mount_point = tempdir.path().join("mount");
+        std::fs::create_dir(&mount_point).unwrap();
+        let ready_path = tempdir.path().join("ready.json");
+        let stale = ReadyFilePayload {
+            version:     "stale".to_string(),
+            pid:         u32::MAX,
+            token:       "dead-owner".to_string(),
+            mount_point: mount_point.display().to_string(),
+            volume:      "stale-volume".to_string(),
+            state:       "ready".to_string(),
+        };
+        std::fs::write(&ready_path, serde_json::to_vec(&stale).unwrap()).unwrap();
+
+        reclaim_stale_ready_file_after_retirement(&ready_path, || {
+            std::fs::write(&ready_path, b"concurrent replacement").unwrap();
+        })
+        .unwrap();
+        assert_eq!(
+            std::fs::read(&ready_path).unwrap(),
+            b"concurrent replacement"
+        );
+    }
+
+    #[test]
+    fn ready_file_preserves_live_and_unknown_existing_owners() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let mount_point = tempdir.path().join("mount");
+        std::fs::create_dir(&mount_point).unwrap();
+        let ready_path = tempdir.path().join("ready.json");
+        let live = ReadyFilePayload {
+            version:     build_info::PKG_VERSION.to_string(),
+            pid:         std::process::id(),
+            token:       "live-owner".to_string(),
+            mount_point: mount_point.display().to_string(),
+            volume:      "live-volume".to_string(),
+            state:       "ready".to_string(),
+        };
+        let live_bytes = serde_json::to_vec(&live).unwrap();
+        std::fs::write(&ready_path, &live_bytes).unwrap();
+
+        assert!(ReadyFileGuard::create(ready_path.clone(), &mount_point, "volume").is_err());
+        assert_eq!(std::fs::read(&ready_path).unwrap(), live_bytes);
+
+        let unknown = b"foreign replacement";
+        std::fs::write(&ready_path, unknown).unwrap();
+        assert!(ReadyFileGuard::create(ready_path.clone(), &mount_point, "volume").is_err());
+        assert_eq!(std::fs::read(&ready_path).unwrap(), unknown);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_reclaim_preserves_a_symlink_even_when_its_target_looks_reclaimable() {
+        use std::os::unix::fs::symlink;
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let mount_point = tempdir.path().join("mount");
+        std::fs::create_dir(&mount_point).unwrap();
+        let ready_path = tempdir.path().join("ready.json");
+        let target_path = tempdir.path().join("foreign-target.json");
+        let stale = ReadyFilePayload {
+            version:     "stale".to_string(),
+            pid:         u32::MAX,
+            token:       "dead-owner".to_string(),
+            mount_point: mount_point.display().to_string(),
+            volume:      "stale-volume".to_string(),
+            state:       "ready".to_string(),
+        };
+        let target_bytes = serde_json::to_vec(&stale).unwrap();
+        std::fs::write(&target_path, &target_bytes).unwrap();
+        symlink(&target_path, &ready_path).unwrap();
+
+        assert!(ReadyFileGuard::create(ready_path.clone(), &mount_point, "volume").is_err());
+        assert_eq!(std::fs::read_link(&ready_path).unwrap(), target_path);
+        assert_eq!(std::fs::read(&target_path).unwrap(), target_bytes);
     }
 }

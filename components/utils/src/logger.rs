@@ -16,7 +16,10 @@
 
 use opentelemetry::{KeyValue, global, trace::TracerProvider as _};
 use opentelemetry_otlp::WithExportConfig;
-use opentelemetry_sdk::{propagation::TraceContextPropagator, trace::Sampler};
+use opentelemetry_sdk::{
+    propagation::TraceContextPropagator,
+    trace::{Sampler, SdkTracerProvider},
+};
 use opentelemetry_semantic_conventions::{attribute, resource};
 use sentry::ClientInitGuard;
 use serde::{Deserialize, Serialize};
@@ -95,7 +98,11 @@ const DEFAULT_LOG_TARGETS: &str = "info";
 pub fn init_global_logging(
     app_name: &str,
     opts: &LoggingOptions,
-) -> (Vec<WorkerGuard>, Option<ClientInitGuard>) {
+) -> (
+    Vec<WorkerGuard>,
+    Option<ClientInitGuard>,
+    Option<SdkTracerProvider>,
+) {
     let mut guards = vec![];
     let dir = &opts.dir;
     let level = &opts.level;
@@ -198,7 +205,7 @@ pub fn init_global_logging(
         .with(err_file_logging_layer.with_filter(filter::LevelFilter::ERROR))
         .with(sentry_layer);
 
-    if enable_otlp_tracing {
+    let tracer_provider = if enable_otlp_tracing {
         global::set_text_map_propagator(TraceContextPropagator::new());
         let endpoint = opts.otlp_endpoint.as_ref().map_or_else(
             || DEFAULT_OTLP_ENDPOINT.to_string(),
@@ -208,6 +215,7 @@ pub fn init_global_logging(
         let exporter = opentelemetry_otlp::SpanExporter::builder()
             .with_tonic()
             .with_endpoint(endpoint)
+            .with_timeout(std::time::Duration::from_secs(2))
             .build()
             .expect("otlp tracer install failed");
         let resource = opentelemetry_sdk::Resource::builder_empty()
@@ -223,46 +231,100 @@ pub fn init_global_logging(
             .with_resource(resource)
             .build();
         let tracer = provider.tracer(app_name.to_string());
-        global::set_tracer_provider(provider);
+        global::set_tracer_provider(provider.clone());
         let tracing_layer = Some(tracing_opentelemetry::layer().with_tracer(tracer));
         let subscriber = subscriber.with(tracing_layer);
         tracing::subscriber::set_global_default(subscriber)
             .expect("error setting global tracing subscriber");
+        Some(provider)
     } else {
         tracing::subscriber::set_global_default(subscriber)
             .expect("error setting global tracing subscriber");
-    }
+        None
+    };
 
-    (guards, sentry_guard)
+    (guards, sentry_guard, tracer_provider)
 }
 
-pub fn init_global_logging_without_runtime(
-    app_name: &str,
-    opts: &LoggingOptions,
-) -> (Vec<WorkerGuard>, Option<ClientInitGuard>) {
-    // The opentelemetry batch processor and the OTLP exporter needs a Tokio
-    // runtime. Create a dedicated runtime for them. One thread should be
-    // enough.
-    //
-    // (Alternatively, instead of batching, we could use the "simple
-    // processor", which doesn't need Tokio, and use "reqwest-blocking"
-    // feature for the OTLP exporter, which also doesn't need Tokio.  However,
-    // batching is considered best practice, and also I have the feeling that
-    // the non-Tokio codepaths in the opentelemetry crate are less used and
-    // might be more buggy, so better to stay on the well-beaten path.)
-    //
-    // We leak the runtime so that it keeps running after we exit the
-    // function.
-    let runtime = Box::leak(Box::new(
+pub struct LoggingGuard {
+    worker_guards:   Vec<WorkerGuard>,
+    sentry_guard:    Option<ClientInitGuard>,
+    tracer_provider: Option<SdkTracerProvider>,
+    runtime:         Option<tokio::runtime::Runtime>,
+}
+
+impl LoggingGuard {
+    pub fn shutdown(mut self, deadline: std::time::Duration) { self.shutdown_inner(deadline); }
+
+    fn shutdown_inner(&mut self, deadline: std::time::Duration) {
+        if self.tracer_provider.is_none()
+            && self.runtime.is_none()
+            && self.worker_guards.is_empty()
+            && self.sentry_guard.is_none()
+        {
+            return;
+        }
+
+        let provider = self.tracer_provider.take();
+        let runtime = self.runtime.take();
+        let worker_guards = std::mem::take(&mut self.worker_guards);
+        let sentry_guard = self.sentry_guard.take();
+        let (completed_tx, completed_rx) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::Builder::new()
+            .name("kiseki-telemetry-shutdown".to_string())
+            .spawn(move || {
+                let provider_error = provider
+                    .and_then(|provider| provider.shutdown().err())
+                    .map(|error| error.to_string());
+                if let Some(runtime) = runtime {
+                    runtime.shutdown_timeout(deadline);
+                }
+                drop(worker_guards);
+                drop(sentry_guard);
+                let _ = completed_tx.send(provider_error);
+            });
+
+        let Ok(_worker) = worker else {
+            tracing::warn!("failed to start bounded telemetry shutdown worker");
+            return;
+        };
+        match completed_rx.recv_timeout(deadline) {
+            Ok(Some(error)) => {
+                tracing::warn!(%error, "failed to shut down OTLP tracer provider");
+            }
+            Ok(None) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                tracing::warn!(?deadline, "telemetry shutdown exceeded its deadline");
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                tracing::warn!("telemetry shutdown worker exited without reporting completion");
+            }
+        }
+    }
+}
+
+impl Drop for LoggingGuard {
+    fn drop(&mut self) { self.shutdown_inner(std::time::Duration::from_secs(1)) }
+}
+
+pub fn init_global_logging_without_runtime(app_name: &str, opts: &LoggingOptions) -> LoggingGuard {
+    let runtime = opts.enable_otlp_tracing.then(|| {
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .thread_name("otlp runtime thread")
             .worker_threads(1)
             .build()
-            .unwrap(),
-    ));
-    let _guard = runtime.enter();
-    init_global_logging(app_name, opts)
+            .expect("failed to build OTLP runtime")
+    });
+    let runtime_guard = runtime.as_ref().map(tokio::runtime::Runtime::enter);
+    let (worker_guards, sentry_guard, tracer_provider) = init_global_logging(app_name, opts);
+    drop(runtime_guard);
+    LoggingGuard {
+        worker_guards,
+        sentry_guard,
+        tracer_provider,
+        runtime,
+    }
 }
 
 #[allow(dead_code)]

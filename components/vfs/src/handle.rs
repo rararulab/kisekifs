@@ -83,7 +83,7 @@ impl HandleTable {
                 self.data_manager
                     .open_file_reader(inode, fh, length as usize)
                     .await,
-                Some(self.data_manager.open_file_writer(inode, length)),
+                Some(self.data_manager.open_file_writer(inode, length)?),
             ),
             _ => LibcSnafu { errno: libc::EPERM }.fail()?,
         };
