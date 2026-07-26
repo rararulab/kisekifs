@@ -2,6 +2,11 @@ name: Lint
 
 on:
   workflow_call:
+    inputs:
+      run_code:
+        description: "Whether code (vs docs-only) changed; gates the heavy jobs."
+        type: string
+        default: "true"
 
 concurrency:
   group: lint-${{ github.event.pull_request.number || github.sha }}
@@ -27,6 +32,7 @@ jobs:
   rust-format:
     name: Rust Format
     runs-on: ubuntu-latest
+    if: inputs.run_code == 'true'
     outputs:
       rust-version: ${{ steps.rust-version.outputs.version }}
     steps:
@@ -75,10 +81,9 @@ jobs:
     needs: [rust-format]
     if: always()
     steps:
-      - name: Check all lint jobs status
-        run: |
-          if [[ "${{ needs.rust-format.result }}" != "success" ]]; then
-            echo "One or more lint jobs failed"
-            exit 1
-          fi
-          echo "All lint jobs passed successfully"
+      # A skipped job (docs-only change) counts as passing; only a real
+      # failure/cancellation blocks.
+      - uses: re-actors/alls-green@release/v1
+        with:
+          jobs: ${{ toJSON(needs) }}
+          allowed-skips: rust-format
