@@ -32,6 +32,7 @@ crossbeam-queue = "0.3.12"
 dashmap = "5.5.3"
 features = { version = "0.10.0" }
 fuser = { version = "0.16.0", features = ["libfuse", "serializable"] }
+fuse-backend-rs = "0.14"
 futures = "0.3.31"
 fs4 = { version = "0.6.6", features = ["sync"] }
 humantime = "2.2.0"
