@@ -40,6 +40,10 @@ impl IdTable {
     }
 
     /// Return the next unused ID from the table.
+    // The write guard is deliberately held across `increase_count_by` to
+    // serialize ID allocation (the read-modify-write must be atomic), so the
+    // lint's early-drop suggestion does not apply.
+    #[allow(clippy::significant_drop_tightening)]
     pub async fn next(&self) -> Result<u64> {
         let mut next_max_pair = self.next_max_pair.write().await;
         if next_max_pair.0 >= next_max_pair.1 {

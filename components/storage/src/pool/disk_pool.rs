@@ -53,7 +53,7 @@ impl DiskPagePool {
         path: P,
         page_size: usize,
         capacity: usize,
-    ) -> Result<Arc<DiskPagePool>> {
+    ) -> Result<Arc<Self>> {
         let start = Instant::now();
         if page_size == 0 || capacity == 0 || !capacity.is_multiple_of(page_size) {
             return InvalidPagePoolConfigSnafu {
@@ -85,7 +85,7 @@ impl DiskPagePool {
             page_size,
             capacity,
             queue,
-            notify: Default::default(),
+            notify: Notify::default(),
             file: RwLock::new(file),
         }))
     }
@@ -112,7 +112,7 @@ impl DiskPagePool {
 
     pub(crate) fn remain_page_cnt(&self) -> usize { self.queue.len() }
 
-    pub(crate) fn total_page_cnt(&self) -> usize { self.capacity / self.page_size }
+    pub(crate) const fn total_page_cnt(&self) -> usize { self.capacity / self.page_size }
 }
 
 impl Display for DiskPagePool {
@@ -148,6 +148,10 @@ impl Page {
         Ok(offset..end)
     }
 
+    // `reader` borrows the mmap read guard for the whole copy, so the guard
+    // cannot drop before the block's tail expression; the lint can't see
+    // through that borrow.
+    #[allow(clippy::significant_drop_tightening)]
     pub(crate) async fn copy_to_writer<W>(
         &self,
         offset: usize,
@@ -158,13 +162,17 @@ impl Page {
         W: tokio::io::AsyncWrite + Unpin + ?Sized,
     {
         let range = self.checked_range(offset, length)?;
-        let guard = self.pool.file.read().await;
-        let mut reader = guard
-            .range_reader(self.cal_offset() + range.start, range.len())
-            .context(DiskPoolMmapSnafu)?;
-        let copy_len = tokio::io::copy(&mut reader, writer)
-            .await
-            .context(UnknownIOSnafu)?;
+        // Hold the mmap read lock only for the duration of the copy, not the
+        // subsequent length validation.
+        let copy_len = {
+            let guard = self.pool.file.read().await;
+            let mut reader = guard
+                .range_reader(self.cal_offset() + range.start, range.len())
+                .context(DiskPoolMmapSnafu)?;
+            tokio::io::copy(&mut reader, writer)
+                .await
+                .context(UnknownIOSnafu)?
+        };
         if copy_len as usize != length {
             return UnexpectedLengthSnafu {
                 subject:  "disk page write",
@@ -176,6 +184,10 @@ impl Page {
         Ok(())
     }
 
+    // `writer` borrows the mmap write guard for the whole copy, so the guard
+    // cannot drop before the block's tail expression; the lint can't see
+    // through that borrow.
+    #[allow(clippy::significant_drop_tightening)]
     pub(crate) async fn copy_from_reader<R>(
         &mut self,
         offset: usize,
@@ -186,13 +198,17 @@ impl Page {
         R: tokio::io::AsyncRead + Unpin + ?Sized,
     {
         let range = self.checked_range(offset, length)?;
-        let mut guard = self.pool.file.write().await;
-        let mut writer = guard
-            .range_writer(self.cal_offset() + range.start, range.len())
-            .context(DiskPoolMmapSnafu)?;
-        let copy_len = tokio::io::copy(reader, &mut writer)
-            .await
-            .context(UnknownIOSnafu)?;
+        // Hold the mmap write lock only for the duration of the copy, not the
+        // subsequent length validation.
+        let copy_len = {
+            let mut guard = self.pool.file.write().await;
+            let mut writer = guard
+                .range_writer(self.cal_offset() + range.start, range.len())
+                .context(DiskPoolMmapSnafu)?;
+            tokio::io::copy(reader, &mut writer)
+                .await
+                .context(UnknownIOSnafu)?
+        };
         if copy_len as usize != length {
             return UnexpectedLengthSnafu {
                 subject:  "disk page read",

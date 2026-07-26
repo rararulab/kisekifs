@@ -395,12 +395,14 @@ async fn migrate_once(
     )
     .await?;
 
-    let mut staged_index = staged_index.write().await;
-    if staged_index
-        .get(&entry.slice_key)
-        .is_some_and(|current| current.same_generation(entry))
     {
-        staged_index.remove(&entry.slice_key);
+        let mut staged_index = staged_index.write().await;
+        if staged_index
+            .get(&entry.slice_key)
+            .is_some_and(|current| current.same_generation(entry))
+        {
+            staged_index.remove(&entry.slice_key);
+        }
     }
     Ok(())
 }
@@ -886,7 +888,7 @@ mod tests {
         assert_eq!(total_release_page, 1);
 
         let cache_index = cache.index.get(&slice_key).await.unwrap();
-        println!("{:?}", cache_index);
+        println!("{cache_index:?}");
         // we should be able to find the block from local storage.
         let bytes = cache
             .local_storage

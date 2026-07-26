@@ -88,6 +88,10 @@ impl LoggingOptions {
 const DEFAULT_LOG_TARGETS: &str = "info";
 
 #[allow(clippy::print_stdout)]
+// The otlp `exporter` temporary is moved into the tracer provider builder a few
+// lines later; keeping the intermediate binding reads far clearer than nesting
+// its multi-line `.build().expect(...)` inside `.with_batch_exporter(...)`.
+#[allow(clippy::significant_drop_tightening)]
 pub fn init_global_logging(
     app_name: &str,
     opts: &LoggingOptions,
@@ -149,8 +153,7 @@ pub fn init_global_logging(
     // let filter = Targets::new().with_target("kiseki", LevelFilter::DEBUG);
     let sampler = opts
         .tracing_sample_ratio
-        .map(Sampler::TraceIdRatioBased)
-        .unwrap_or(Sampler::AlwaysOn);
+        .map_or(Sampler::AlwaysOn, Sampler::TraceIdRatioBased);
 
     let (sentry_layer, sentry_guard) = match init_sentry() {
         None => (None, None),
@@ -197,12 +200,11 @@ pub fn init_global_logging(
 
     if enable_otlp_tracing {
         global::set_text_map_propagator(TraceContextPropagator::new());
-        let endpoint = opts
-            .otlp_endpoint
-            .as_ref()
-            .map(|e| format!("http://{}", e))
-            .unwrap_or(DEFAULT_OTLP_ENDPOINT.to_string());
-        println!("find otlp tracing config: {}", endpoint);
+        let endpoint = opts.otlp_endpoint.as_ref().map_or_else(
+            || DEFAULT_OTLP_ENDPOINT.to_string(),
+            |e| format!("http://{e}"),
+        );
+        println!("find otlp tracing config: {endpoint}");
         let exporter = opentelemetry_otlp::SpanExporter::builder()
             .with_tonic()
             .with_endpoint(endpoint)

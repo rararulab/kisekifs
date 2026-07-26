@@ -50,7 +50,7 @@ pub(crate) struct HandleTable {
 
 impl HandleTable {
     pub(crate) fn new(data_manager_ref: DataManagerRef) -> HandleTableRef {
-        Arc::new(HandleTable {
+        Arc::new(Self {
             data_manager: data_manager_ref,
             handles:      Default::default(),
             next_fh:      AtomicU64::new(1),
@@ -165,29 +165,29 @@ pub(crate) enum Handle {
 impl Handle {
     pub(crate) fn get_fh(&self) -> FH {
         match self {
-            Handle::File(h) => h.fh,
-            Handle::Dir(h) => h.fh,
+            Self::File(h) => h.fh,
+            Self::Dir(h) => h.fh,
         }
     }
 
     pub(crate) fn as_file_handle(&self) -> Option<Arc<FileHandle>> {
         match self {
-            Handle::File(h) => Some(h.clone()),
+            Self::File(h) => Some(h.clone()),
             _ => None,
         }
     }
 
     pub(crate) fn as_dir_handle(&self) -> Option<Arc<DirHandle>> {
         match self {
-            Handle::Dir(h) => Some(h.clone()),
+            Self::Dir(h) => Some(h.clone()),
             _ => None,
         }
     }
 
     pub(crate) async fn wait_all_operations_done(&self, ctx: Arc<FuseContext>) -> Result<()> {
         match self {
-            Handle::File(h) => h.wait_all_operations_done(Some(ctx)).await,
-            Handle::Dir(_) => Ok(()),
+            Self::File(h) => h.wait_all_operations_done(Some(ctx)).await,
+            Self::Dir(_) => Ok(()),
         }
     }
 }
@@ -231,7 +231,7 @@ impl FileHandle {
         fr: Arc<FileReader>,
         fw: Option<Arc<FileWriter>>,
     ) -> Self {
-        FileHandle {
+        Self {
             fh,
             inode,
             reader: fr,
@@ -255,7 +255,7 @@ impl FileHandle {
             .compare_exchange(lock_owner, 0, Ordering::AcqRel, Ordering::Relaxed);
     }
 
-    pub(crate) fn has_writer(&self) -> bool { self.writer.is_some() }
+    pub(crate) const fn has_writer(&self) -> bool { self.writer.is_some() }
 
     pub(crate) async fn read_lock(&self, ctx: Arc<FuseContext>) -> Option<FileHandleReadGuard> {
         let cancel_token = ctx.cancellation_token.clone();
@@ -280,8 +280,9 @@ impl FileHandle {
             self.reader_cnt.fetch_sub(1, Ordering::AcqRel);
             return None;
         };
-        let mut write_guard = self.operations.write().await;
-        write_guard
+        self.operations
+            .write()
+            .await
             .entry(ctx.pid)
             .or_default()
             .insert(ctx.unique, ctx.clone());
@@ -313,10 +314,10 @@ impl FileHandle {
                 // released.
                 tokio::select! {
                     _ = self.exclusive_lock_notify.notified() => {
-                        debug!("exclusive lock is released")
+                        debug!("exclusive lock is released");
                     }
                     _ = self.reader_notify.notified() => {
-                        debug!("reader is released")
+                        debug!("reader is released");
                     }
                     _ = cancel_token.cancelled() => {
                         // decrease the write wait count
@@ -344,8 +345,9 @@ impl FileHandle {
             return None;
         }
 
-        let mut write_guard = self.operations.write().await;
-        write_guard
+        self.operations
+            .write()
+            .await
             .entry(ctx.pid)
             .or_default()
             .insert(ctx.unique, ctx.clone());
@@ -399,10 +401,10 @@ impl FileHandle {
             if let Some(cancel_token) = cancel_token.as_ref() {
                 tokio::select! {
                     _ = self.exclusive_lock_notify.notified() => {
-                        debug!("exclusive lock is released")
+                        debug!("exclusive lock is released");
                     }
                     _ = self.reader_notify.notified() => {
-                        debug!("reader is released")
+                        debug!("reader is released");
                     }
                     _ = cancel_token.cancelled() => {
                         error!("wait all operations done is cancelled");
@@ -412,10 +414,10 @@ impl FileHandle {
             } else {
                 tokio::select! {
                     _ = self.exclusive_lock_notify.notified() => {
-                        debug!("exclusive lock is released")
+                        debug!("exclusive lock is released");
                     }
                     _ = self.reader_notify.notified() => {
-                        debug!("reader is released")
+                        debug!("reader is released");
                     }
                 }
             }
@@ -488,7 +490,7 @@ impl Drop for FileHandleReadGuard {
     fn drop(&mut self) {
         debug!("read lock is released");
         self.reader_cnt.fetch_sub(1, Ordering::AcqRel);
-        self.reader_notify.notify_waiters()
+        self.reader_notify.notify_waiters();
     }
 }
 
@@ -501,7 +503,7 @@ pub(crate) struct DirHandle {
 
 impl DirHandle {
     fn new(inode: Ino, fh: FH) -> Self {
-        DirHandle {
+        Self {
             fh,
             inode,
             inner: RwLock::new(DirHandleInner {
