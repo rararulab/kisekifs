@@ -7,7 +7,7 @@ edition.workspace = true
 
 [dependencies]
 fuser.workspace = true
-fuse-backend-rs.workspace = true
+fuse-backend-rs = { workspace = true, features = ["fusedev", "async-io"] }
 libc.workspace = true
 snafu.workspace = true
 tokio.workspace = true
