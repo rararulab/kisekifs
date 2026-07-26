@@ -9,6 +9,7 @@ edition.workspace = true
 async-trait.workspace = true
 fuser.workspace = true
 fuse-backend-rs = { workspace = true, features = ["fusedev", "async-io"] }
+futures.workspace = true
 libc.workspace = true
 snafu.workspace = true
 tokio.workspace = true

@@ -1871,6 +1871,7 @@ dependencies = [
  "async-trait",
  "fuse-backend-rs",
  "fuser",
+ "futures",
  "kiseki-common",
  "kiseki-meta",
  "kiseki-storage",
