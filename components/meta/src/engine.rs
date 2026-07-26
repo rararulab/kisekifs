@@ -923,7 +923,7 @@ impl MetaEngine {
         size: u64,
         skip_perm_check: bool,
     ) -> Result<InodeAttr> {
-        if let Some(of) = self.open_files.load(&inode).await {
+        let attr = if let Some(of) = self.open_files.load(&inode).await {
             let guard = of.read_guard().await;
             if guard.attr.length == size {
                 return Ok(guard.attr.clone());
@@ -932,10 +932,13 @@ impl MetaEngine {
                 .backend
                 .do_truncate(ctx, inode, size, skip_perm_check)?;
             drop(guard); // explicitly drop the guard for keeping holding the lock
-            Ok(attr)
+            attr
         } else {
-            self.backend.do_truncate(ctx, inode, size, skip_perm_check)
-        }
+            self.backend
+                .do_truncate(ctx, inode, size, skip_perm_check)?
+        };
+        self.open_files.invalid(inode, InvalidReq::All).await;
+        Ok(attr)
     }
 }
 

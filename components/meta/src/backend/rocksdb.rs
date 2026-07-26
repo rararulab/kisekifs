@@ -29,7 +29,7 @@ use kiseki_types::{
     entry::DEntry,
     ino::{Ino, ROOT_INO, ZERO_INO},
     setting::Format,
-    slice::{SLICE_BYTES, Slice, Slices},
+    slice::{EMPTY_SLICE_ID, SLICE_BYTES, Slice, Slices},
     stat::DirStat,
 };
 use rocksdb::{DBAccess, MultiThreaded};
@@ -437,6 +437,33 @@ fn stage_slice_commit(
     ));
     ensure!(attr.is_file(), LibcSnafu { errno: libc::EPERM });
 
+    let (inserted, slice_count) = stage_chunk_slice(txn, inode, chunk_index, slice)?;
+
+    let new_len = chunk_index as u64 * CHUNK_SIZE as u64
+        + slice.get_chunk_pos() as u64
+        + slice.get_size() as u64;
+    let grew_by = new_len.saturating_sub(attr.length);
+    if inserted || grew_by != 0 {
+        if grew_by != 0 {
+            attr.length = new_len;
+        }
+        attr.update_modification_time();
+        txn_put_attr(txn, inode, &attr)?;
+    }
+
+    Ok(SliceCommitResult {
+        grew_by,
+        slice_count,
+        inserted,
+    })
+}
+
+fn stage_chunk_slice(
+    txn: &rocksdb::Transaction<rocksdb::OptimisticTransactionDB<MultiThreaded>>,
+    inode: Ino,
+    chunk_index: ChunkIndex,
+    slice: &Slice,
+) -> Result<(bool, usize)> {
     let slices_key = key::chunk_slices(inode, chunk_index);
     let mut slices_buf = rocksdb_timed_op!(
         db_gets_total,
@@ -463,32 +490,13 @@ fn stage_slice_commit(
         .any(|existing| existing == encoded_slice);
     if inserted {
         slices_buf.extend_from_slice(&encoded_slice);
+        rocksdb_timed_op!(
+            db_puts_total,
+            db_put_duration_ms,
+            db_try!(txn.put(&slices_key, &slices_buf))
+        );
     }
-
-    let new_len = chunk_index as u64 * CHUNK_SIZE as u64
-        + slice.get_chunk_pos() as u64
-        + slice.get_size() as u64;
-    let grew_by = new_len.saturating_sub(attr.length);
-    if inserted || grew_by != 0 {
-        if grew_by != 0 {
-            attr.length = new_len;
-        }
-        attr.update_modification_time();
-        txn_put_attr(txn, inode, &attr)?;
-        if inserted {
-            rocksdb_timed_op!(
-                db_puts_total,
-                db_put_duration_ms,
-                db_try!(txn.put(&slices_key, &slices_buf))
-            );
-        }
-    }
-
-    Ok(SliceCommitResult {
-        grew_by,
-        slice_count: slices_buf.len() / SLICE_BYTES,
-        inserted,
-    })
+    Ok((inserted, slices_buf.len() / SLICE_BYTES))
 }
 
 fn set_dentry_in_write_batch<const TRANSACTION: bool>(
@@ -1311,10 +1319,24 @@ impl Backend for RocksdbBackend {
             ctx.check_access(&old_attr, kiseki_common::MODE_MASK_W)?;
         }
         assert_ne!(length, old_attr.length, "length is the same");
+        ensure!(
+            usize::try_from(length).is_ok() && usize::try_from(old_attr.length).is_ok(),
+            LibcSnafu { errno: libc::EFBIG }
+        );
+        let old_length = old_attr.length as usize;
+        let new_length = length as usize;
+        if new_length > old_length {
+            let mut position = old_length;
+            while position < new_length {
+                let chunk_index = position / CHUNK_SIZE;
+                let chunk_position = position % CHUNK_SIZE;
+                let hole_length = (CHUNK_SIZE - chunk_position).min(new_length - position);
+                let hole = Slice::new_owned(chunk_position, EMPTY_SLICE_ID, hole_length);
+                stage_chunk_slice(&txn, inode, chunk_index, &hole)?;
+                position += hole_length;
+            }
+        }
         old_attr.update_length(length);
-
-        // TODO: review me, juicefs make hole manually here, by appending empty slices
-        // info.
 
         txn_put_attr(&txn, inode, &old_attr)?;
         rocksdb_timed_op!(

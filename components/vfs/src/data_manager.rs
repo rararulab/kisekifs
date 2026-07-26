@@ -90,6 +90,12 @@ impl DataManager {
             .map_or(0, |w| w.value().get_length() as u64)
     }
 
+    pub(crate) fn set_length(&self, ino: Ino, length: usize) {
+        if let Some(writer) = self.file_writers.get(&ino) {
+            writer.set_length(length);
+        }
+    }
+
     pub(crate) fn update_mtime(&self, ino: Ino, mtime: SystemTime) -> Result<()> {
         debug!("update_mtime do nothing, {ino}: {:?}", mtime);
         Ok(())

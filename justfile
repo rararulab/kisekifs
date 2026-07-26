@@ -50,6 +50,9 @@ alias t := test
 @test:
     KISEKI_DISABLE_DISK_POOL=1 cargo nextest run --workspace --all-features
 
+@test-mounted *args:
+    tests/scripts/run-mounted.sh {{args}}
+
 alias b := bench
 @bench:
     #cargo bench -- --verbose --color always --nocapture --show-output

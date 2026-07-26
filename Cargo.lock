@@ -4099,7 +4099,12 @@ dependencies = [
 name = "tests"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "rangemap",
+ "rustix 0.38.44",
+ "serde",
+ "tempfile",
+ "toml",
 ]
 
 [[package]]
@@ -4336,6 +4341,7 @@ dependencies = [
  "serde_spanned",
  "toml_datetime",
  "toml_write",
+ "winnow",
 ]
 
 [[package]]
@@ -5209,6 +5215,15 @@ name = "windows_x86_64_msvc"
 version = "0.53.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "271414315aff87387382ec3d271b52d7ae78726f5d44ac98b4f4030c91880486"
+
+[[package]]
+name = "winnow"
+version = "0.7.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df79d97927682d2fd8adb29682d1140b343be4ac0f08fd68b7765d9c059d3945"
+dependencies = [
+ "memchr",
+]
 
 [[package]]
 name = "wit-bindgen"

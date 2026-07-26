@@ -1229,6 +1229,43 @@ mod attribute_operations {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn truncate_open_file_updates_length_and_zero_fills_growth() -> Result<()> {
+        let vfs = Arc::new(test_utils::make_vfs().await);
+        let ctx = Arc::new(FuseContext::background());
+        let (file, fh) =
+            test_utils::create_test_file(&vfs, ctx.clone(), ROOT_INO, "truncate-open", 0o644)
+                .await?;
+
+        vfs.write(ctx.clone(), file.inode, fh, 8192, b"tail", 0, 0, None)
+            .await?;
+        for size in [3, 10] {
+            let attr = vfs
+                .set_attr(
+                    ctx.clone(),
+                    file.inode,
+                    SetAttrFlags::SIZE.bits(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(size),
+                    Some(fh),
+                    None,
+                )
+                .await?;
+            assert_eq!(attr.length, size);
+        }
+
+        let actual = vfs
+            .read(ctx.clone(), file.inode, fh, 0, 32, 0, None)
+            .await?;
+        assert_eq!(actual.as_ref(), &[0; 10]);
+        vfs.release(ctx, file.inode, fh).await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn atime_only_setattr_does_not_require_mtime() -> Result<()> {
         let vfs = Arc::new(test_utils::make_vfs().await);
         let ctx = Arc::new(FuseContext::background());

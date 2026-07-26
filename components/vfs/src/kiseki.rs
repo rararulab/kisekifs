@@ -188,6 +188,8 @@ impl KisekiVFS {
             .truncate(ctx, ino, size, _fh.is_some())
             .await
             .context(MetaSnafu)?;
+        self.data_manager.set_length(ino, size as usize);
+        self.data_manager.truncate_reader(ino, size).await;
         Ok(attr)
     }
 

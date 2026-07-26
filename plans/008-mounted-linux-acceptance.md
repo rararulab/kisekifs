@@ -12,13 +12,32 @@
 
 ## Status
 
-- **State**: TODO
+- **State**: IN PROGRESS
 - **Priority**: P1
 - **Effort**: L
 - **Risk**: MED
 - **Depends on**: `plans/006-crash-consistent-write-publication.md`, `plans/007-safe-buffer-data-path.md`
 - **Category**: tests / docs
 - **Planned at**: commit `2fb2c95`, 2026-07-20
+### Local completion evidence at 2026-07-26
+
+Implemented the versioned Linux support contract, machine-checked manifest,
+hermetic mounted-test harness, explicit CLI cache/permission controls, and a
+required privileged Linux CI job. Mounted regressions also fixed overlapping
+slice reads, truncate growth holes, concurrent flush notification loss, and an
+open/last-close race that could hand a new file descriptor a retired writer.
+
+Local verification on `rara-linux`:
+
+- `cargo check --all --all-features`
+- `cargo clippy --workspace --all-targets --all-features --no-deps -- -D warnings`
+- `cargo +nightly fmt --all -- --check`
+- focused overlap, truncate, concurrent-finish, and manifest tests
+- two consecutive full mounted runs, both 9/9
+- 20 consecutive lifecycle-group runs
+- an intentional mounted smoke failure followed by zero leaked mount,
+  process, or temporary root
+
 
 ## Why this matters
 

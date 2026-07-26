@@ -19,7 +19,7 @@ use std::{
     str::FromStr,
 };
 
-use clap::Args;
+use clap::{ArgAction, Args};
 use fuser::MountOption;
 use kiseki_common::KISEKI;
 use kiseki_fuse::{FuseConfig, null};
@@ -35,6 +35,7 @@ const MOUNT_OPTIONS_HEADER: &str = "Mount options";
 const LOGGING_OPTIONS_HEADER: &str = "Logging options";
 const META_OPTIONS_HEADER: &str = "Meta options";
 const STORAGE_OPTIONS_HEADER: &str = "Object storage options";
+const CACHE_OPTIONS_HEADER: &str = "Cache options";
 
 #[derive(Clone)]
 pub struct ObjectStorageDsn(String);
@@ -81,6 +82,7 @@ pub struct MountArgs {
     help = "Automatically unmount on exit",
     help_heading = MOUNT_OPTIONS_HEADER,
     default_value = "true",
+    action = ArgAction::Set,
     )]
     pub auto_unmount: bool,
 
@@ -92,7 +94,8 @@ pub struct MountArgs {
     help = "Allow other users, including root, to access file system",
     help_heading = MOUNT_OPTIONS_HEADER,
     conflicts_with = "allow_root",
-    default_value = "true",
+    default_value_t = true,
+    action = ArgAction::Set,
     )]
     pub allow_other: bool,
 
@@ -192,6 +195,15 @@ pub struct MountArgs {
         required = true,
     )]
     pub object_storage: ObjectStorageDsn,
+
+    #[arg(
+        long,
+        value_name = "DIRECTORY",
+        help = "Directory for restart-recoverable staged blocks",
+        help_heading = CACHE_OPTIONS_HEADER,
+        default_value = kiseki_common::KISEKI_DEBUG_STAGE_CACHE,
+    )]
+    pub stage_cache_dir: PathBuf,
 }
 
 impl MountArgs {
@@ -257,6 +269,7 @@ impl MountArgs {
         }
         Ok(VFSConfig {
             object_storage,
+            stage_cache_dir: self.stage_cache_dir.clone(),
             ..VFSConfig::default()
         })
     }
@@ -444,5 +457,29 @@ mod tests {
         assert!(!format!("{:?}", cli.mount).contains(secret_marker));
         let error = cli.mount.vfs_config().unwrap_err();
         assert!(!error.to_string().contains(secret_marker));
+    }
+
+    #[test]
+    fn mounted_tests_can_disable_allow_other_and_isolate_the_stage_cache() {
+        let cli = TestCli::try_parse_from([
+            "test",
+            "--auto-unmount",
+            "false",
+            "--object-storage",
+            "file:///tmp/kiseki-objects",
+            "--allow-other",
+            "false",
+            "--stage-cache-dir",
+            "/tmp/kiseki-stage-isolated",
+            "/tmp/kiseki",
+        ])
+        .expect("parse isolated mount arguments");
+
+        assert!(!cli.mount.auto_unmount);
+        assert!(!cli.mount.allow_other);
+        assert_eq!(
+            cli.mount.vfs_config().unwrap().stage_cache_dir,
+            PathBuf::from("/tmp/kiseki-stage-isolated")
+        );
     }
 }

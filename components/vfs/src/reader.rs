@@ -28,7 +28,7 @@ use kiseki_common::{BLOCK_SIZE, BlockIndex, BlockSize, CHUNK_SIZE, ChunkIndex, F
 use kiseki_storage::cache::{file_cache::FileCacheRef, mem_cache::MemCacheRef};
 use kiseki_types::{
     ino::Ino,
-    slice::{OverlookedSlicesRef, Slice, SliceID, SliceKey},
+    slice::{EMPTY_SLICE_ID, OverlookedSlicesRef, Slice, SliceID, SliceKey},
 };
 use kiseki_utils::readable_size::ReadableSize;
 use rangemap::RangeMap;
@@ -213,7 +213,12 @@ impl FileReader {
                      {:?}",
                     chunk_idx, r, new_r, s
                 );
-                virtual_slice_map.insert(new_r, VirtualSlice::Slice(s.clone()));
+                let virtual_slice = if s.get_id() == EMPTY_SLICE_ID {
+                    VirtualSlice::Hole
+                } else {
+                    VirtualSlice::Slice(s.clone())
+                };
+                virtual_slice_map.insert(new_r, virtual_slice);
             }
             drop(range_map);
 
@@ -247,13 +252,15 @@ impl FileReader {
                             chunk_idx, r, s
                         );
                         let sid = s.get_id();
+                        let source_offset =
+                            s.get_underlying_offset() + r.start.saturating_sub(s.get_chunk_pos());
 
                         let _read_len = read_slice_from_cache(
                             sid,
                             engine.file_cache.clone(),
                             engine.mem_cache.clone(),
                             s.get_underlying_size(),
-                            0,
+                            source_offset,
                             &mut dst[start..end],
                         )
                         .await?;
@@ -582,6 +589,54 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reads_preserve_unmodified_bytes_across_overlapping_slices() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let mut meta_config = MetaConfig::default();
+        meta_config.with_dsn(&format!("rocksdb://:{}", tempdir.path().display()));
+        let format = Format::default();
+        kiseki_meta::update_format(&meta_config.dsn, format.clone(), true).unwrap();
+        let meta_engine = kiseki_meta::open(meta_config).unwrap();
+        let (inode, _) = meta_engine
+            .create(
+                Arc::new(FuseContext::background()),
+                ROOT_INO,
+                "overlap",
+                0o600,
+                0,
+                0,
+            )
+            .await
+            .unwrap();
+        let data_manager = Arc::new(
+            DataManager::new(
+                format.chunk_size,
+                meta_engine,
+                new_memory_object_store(),
+                kiseki_storage::cache::file_cache::Config {
+                    stage_cache_dir: tempdir.path().join("stage"),
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+        let writer = data_manager.open_file_writer(inode, 0);
+
+        for (offset, data) in [
+            (0, b"0123456789".as_slice()),
+            (0, b"abc".as_slice()),
+            (7, b"XYZ".as_slice()),
+        ] {
+            writer.write(offset, data).await.unwrap();
+            writer.finish().await.unwrap();
+        }
+
+        let reader = data_manager.open_file_reader(inode, 1, 10).await;
+        let mut actual = [0; 10];
+        assert_eq!(reader.read(0, &mut actual).await.unwrap(), actual.len());
+        assert_eq!(&actual, b"abc3456XYZ");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

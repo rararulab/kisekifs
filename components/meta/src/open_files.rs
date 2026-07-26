@@ -226,6 +226,7 @@ impl OpenFiles {
                 }
                 InvalidReq::All => {
                     of.invalid_all_chunk().await;
+                    of.invalid_attr().await;
                 }
                 InvalidReq::OnlyAttr => {
                     of.invalid_attr().await;
@@ -250,8 +251,6 @@ impl OpenFiles {
 
 pub(crate) enum InvalidReq {
     OneChunk(ChunkIndex),
-    // Models whole-file invalidation; no call site constructs it yet.
-    #[allow(dead_code)]
     All,
     OnlyAttr,
 }

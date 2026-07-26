@@ -7,3 +7,10 @@ edition = "2024"
 
 [dependencies]
 rangemap = "1.6.0"
+
+[dev-dependencies]
+libc.workspace = true
+rustix = { workspace = true, features = ["fs"] }
+serde = { workspace = true, features = ["derive"] }
+tempfile.workspace = true
+toml = "0.8.23"

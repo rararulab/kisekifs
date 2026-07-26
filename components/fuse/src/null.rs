@@ -30,10 +30,7 @@ impl Filesystem for NullFs {}
 
 pub fn mount_check<P: AsRef<Path>>(mountpoint: P) -> Result<(), Whatever> {
     let mountpoint = mountpoint.as_ref();
-    let options = [
-        MountOption::FSName(String::from(KISEKI)),
-        MountOption::AllowRoot,
-    ];
+    let options = [MountOption::FSName(String::from(KISEKI))];
     let session = spawn_mount2(NullFs {}, mountpoint, &options).with_whatever_context(|e| {
         format!("failed to mount null fs on {}; {}", mountpoint.display(), e)
     })?;

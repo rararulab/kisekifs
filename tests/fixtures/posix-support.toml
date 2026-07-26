@@ -1,0 +1,170 @@
+version = 1
+
+[[case]]
+id = "mount.smoke"
+operation = "init, lookup, create, open, write, flush, release"
+status = "supported"
+test = "mounted::smoke::mount_create_unmount"
+
+[[case]]
+id = "namespace.create-remove"
+operation = "create, mkdir, unlink, rmdir"
+status = "supported"
+test = "mounted::semantics::namespace_and_metadata"
+
+[[case]]
+id = "namespace.rename"
+operation = "rename within and across directories"
+status = "supported"
+test = "mounted::semantics::namespace_and_metadata"
+
+[[case]]
+id = "namespace.links"
+operation = "link, symlink, readlink"
+status = "supported"
+test = "mounted::semantics::namespace_and_metadata"
+
+[[case]]
+id = "directory.enumeration"
+operation = "opendir, readdir, releasedir"
+status = "supported"
+test = "mounted::semantics::namespace_and_metadata"
+
+[[case]]
+id = "metadata.attributes"
+operation = "getattr and setattr for mode, size, atime, and mtime"
+status = "supported"
+test = "mounted::semantics::namespace_and_metadata"
+
+[[case]]
+id = "io.eof-empty"
+operation = "read/write empty files and read at or past EOF"
+status = "supported"
+test = "mounted::semantics::io_boundaries"
+
+[[case]]
+id = "io.sparse-truncate"
+operation = "sparse holes and truncate shrink/grow"
+status = "supported"
+test = "mounted::semantics::io_boundaries"
+
+[[case]]
+id = "io.multiblock-chunk"
+operation = "unaligned multi-block and chunk-spanning read/write"
+status = "supported"
+test = "mounted::semantics::io_boundaries"
+
+[[case]]
+id = "descriptor.lifecycle"
+operation = "multiple descriptors, repeated flush, unlink and rename while open"
+status = "supported"
+test = "mounted::semantics::descriptor_lifecycle"
+
+[[case]]
+id = "concurrency.disjoint"
+operation = "parallel writers to disjoint offsets"
+status = "supported"
+test = "mounted::concurrency::ordered_and_disjoint_writes"
+
+[[case]]
+id = "concurrency.ordered-overlap"
+operation = "explicitly ordered overlapping writers and concurrent readers"
+status = "supported"
+test = "mounted::concurrency::ordered_and_disjoint_writes"
+
+[[case]]
+id = "durability.flush-local"
+operation = "flush acknowledgement is locally durable"
+status = "supported"
+test = "mounted::lifecycle::crash_after_local_flush"
+
+[[case]]
+id = "durability.fsync-remote"
+operation = "fsync and fdatasync wait for remote durability"
+status = "supported"
+test = "mounted::lifecycle::crash_after_fsync"
+
+[[case]]
+id = "lifecycle.clean-remount"
+operation = "clean unmount and remount preserve namespace and data"
+status = "supported"
+test = "mounted::lifecycle::clean_remount_and_read_only"
+
+[[case]]
+id = "lifecycle.read-only"
+operation = "read-only mount reads and rejects mutations"
+status = "supported"
+test = "mounted::lifecycle::clean_remount_and_read_only"
+
+[[case]]
+id = "lifecycle.invalid-storage"
+operation = "invalid object storage fails before mount readiness"
+status = "supported"
+test = "mounted::lifecycle::clean_remount_and_read_only"
+
+[[case]]
+id = "lifecycle.crash-fsync"
+operation = "SIGKILL after fsync preserves remote-durable bytes"
+status = "supported"
+test = "mounted::lifecycle::crash_after_fsync"
+
+[[case]]
+id = "lifecycle.crash-flush"
+operation = "SIGKILL after flush recovers the local staged copy"
+status = "supported"
+test = "mounted::lifecycle::crash_after_local_flush"
+
+[[case]]
+id = "fs.statfs"
+operation = "statfs"
+status = "supported"
+test = "mounted::semantics::namespace_and_metadata"
+
+[[case]]
+id = "unsupported.fallocate"
+operation = "recognized fallocate modes"
+status = "unsupported"
+test = "mounted::unsupported::stable_errno_keeps_mount_alive"
+expected_errno = "EOPNOTSUPP"
+
+[[case]]
+id = "unsupported.xattr"
+operation = "getxattr, setxattr, listxattr, removexattr"
+status = "unsupported"
+expected_errno = "ENOSYS"
+
+[[case]]
+id = "unsupported.locks"
+operation = "getlk, setlk, flock"
+status = "unsupported"
+expected_errno = "ENOSYS"
+
+[[case]]
+id = "unsupported.ioctl"
+operation = "ioctl"
+status = "unsupported"
+expected_errno = "ENOSYS"
+
+[[case]]
+id = "unsupported.copy-file-range"
+operation = "copy_file_range"
+status = "unsupported"
+expected_errno = "ENOSYS"
+
+[[case]]
+id = "experimental.mknod"
+operation = "mknod for special files"
+status = "experimental"
+caveat = "The callback exists, but device/FIFO semantics are not a release promise."
+
+[[case]]
+id = "experimental.readdirplus"
+operation = "readdirplus"
+status = "experimental"
+caveat = "The callback exists, but the kernel may select plain readdir."
+
+[[case]]
+id = "experimental.supplementary-groups"
+operation = "supplementary group authorization"
+status = "experimental"
+caveat = "Primary gid is enforced; the full supplementary-group contract is not yet mounted-tested."

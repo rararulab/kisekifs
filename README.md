@@ -46,9 +46,11 @@ JuiceFs reorganize the slices into a linkedlist, kisekifs use [rangemap](https:/
 handle the trick part.
 
 
-# Posix Compliance
+# Filesystem semantics
 
-Totally not compliant with posix, go to the issue page check the details.
+KisekiFS does not claim full POSIX compliance. Its versioned, Linux-only
+supported and intentionally unsupported behavior is listed in the
+[filesystem support matrix](./docs/src/posix-support.md).
 
 ## Disclaimer
 

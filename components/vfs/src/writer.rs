@@ -33,7 +33,7 @@ use std::{
 };
 
 use crossbeam::atomic::AtomicCell;
-use dashmap::DashMap;
+use dashmap::{DashMap, mapref::entry::Entry};
 use kiseki_common::{BLOCK_SIZE, CHUNK_SIZE, ChunkIndex, cal_chunk_idx, cal_chunk_offset};
 use kiseki_meta::MetaEngineRef;
 use kiseki_storage::slice_buffer::SliceBuffer;
@@ -44,7 +44,6 @@ use kiseki_types::{
 use kiseki_utils::readable_size::ReadableSize;
 #[cfg(test)]
 use libc::EBADF;
-use scopeguard::defer;
 use snafu::{OptionExt, ResultExt};
 use tokio::{
     sync::{Notify, RwLock, mpsc},
@@ -63,45 +62,38 @@ impl DataManager {
     /// Creates a new [FileWriter] for the file.
     /// All file handle share the single one [FileWriter].
     pub(crate) fn open_file_writer(self: &Arc<Self>, ino: Ino, len: u64) -> Arc<FileWriter> {
-        let fw = self
-            .file_writers
-            .entry(ino)
-            .or_insert_with(|| {
-                let (tx, rx) = mpsc::channel(200);
-                let fw = FileWriter {
-                    inode:                  ino,
-                    length:                 AtomicUsize::new(len as usize),
-                    chunk_writers:          Default::default(),
-                    slice_flush_queue:      tx,
-                    total_slice_writer_cnt: Arc::new(Default::default()),
-                    cancel_token:           CancellationToken::new(),
-                    seq_generate:           self.id_generator.clone(),
-                    ref_count:              Arc::new(Default::default()),
-                    flush_waiting:          Arc::new(Default::default()),
-                    flush_done_notify:      Arc::new(Default::default()),
-                    write_waiting:          Arc::new(Default::default()),
-                    write_notify:           Arc::new(Default::default()),
-                    pattern:                Default::default(),
-                    early_flush_threshold:  0.3,
-                    flush_error:            Mutex::new(None),
-                    published_slices:       Mutex::new(HashSet::new()),
-                    data_manager:           Arc::downgrade(self),
-                };
+        let fw = self.file_writers.entry(ino).or_insert_with(|| {
+            let (tx, rx) = mpsc::channel(200);
+            let fw = FileWriter {
+                inode:                  ino,
+                length:                 AtomicUsize::new(len as usize),
+                chunk_writers:          Default::default(),
+                slice_flush_queue:      tx,
+                total_slice_writer_cnt: Arc::new(Default::default()),
+                cancel_token:           CancellationToken::new(),
+                seq_generate:           self.id_generator.clone(),
+                ref_count:              Arc::new(Default::default()),
+                operation_lock:         Default::default(),
+                pattern:                Default::default(),
+                early_flush_threshold:  0.3,
+                flush_error:            Mutex::new(None),
+                published_slices:       Mutex::new(HashSet::new()),
+                data_manager:           Arc::downgrade(self),
+            };
 
-                let fw = Arc::new(fw);
-                let fw_cloned = fw.clone();
-                tokio::spawn(async move {
-                    let flusher = FileWriterFlusher {
-                        fw:       fw_cloned,
-                        flush_rx: rx,
-                    };
-                    flusher.run().await
-                });
-                fw
-            })
-            .clone();
+            let fw = Arc::new(fw);
+            let fw_cloned = fw.clone();
+            tokio::spawn(async move {
+                let flusher = FileWriterFlusher {
+                    fw:       fw_cloned,
+                    flush_rx: rx,
+                };
+                flusher.run().await
+            });
+            fw
+        });
         fw.ref_count.fetch_add(1, Ordering::AcqRel);
-        fw
+        fw.clone()
     }
 
     /// Use the [FileWriter] to write data to the file.
@@ -212,14 +204,7 @@ pub struct FileWriter {
     // 1. when we open, we increase the counter.
     // 2. when we close the file, decrease the counter.
     ref_count:              Arc<AtomicUsize>,
-    flush_waiting:          Arc<AtomicUsize>,
-    flush_done_notify:      Arc<Notify>,
-    write_waiting:          Arc<AtomicUsize>,
-    // reserved for the not-yet-wired write-throttle wakeup (mirrors
-    // flush_done_notify); write_waiting is maintained but nothing waits on
-    // this Notify yet.
-    #[allow(dead_code)]
-    write_notify:           Arc<Notify>,
+    operation_lock:         RwLock<()>,
     total_slice_writer_cnt: Arc<AtomicUsize>,
 
     // random write early flush
@@ -248,6 +233,8 @@ pub struct FileWriter {
 
 impl FileWriter {
     pub fn get_length(self: &Arc<Self>) -> usize { self.length.load(Ordering::Acquire) }
+
+    pub(crate) fn set_length(&self, length: usize) { self.length.store(length, Ordering::Release) }
 
     /// Record a fatal error from a background flush task.
     /// Only the first error is kept (later ones are logged and dropped),
@@ -304,6 +291,11 @@ impl FileWriter {
             return Ok(0);
         }
 
+        // Explicit flushes take the write side so they cannot observe a slice
+        // halfway through its Writing -> Dirty transition. Independent writes
+        // retain read-side concurrency.
+        let _operation_guard = self.operation_lock.read().await;
+
         // surface any error recorded by a background flush task before
         // accepting new data.
         if let Some(e) = self.take_flush_error() {
@@ -319,13 +311,6 @@ impl FileWriter {
             // we have too many slice writers, we should wait for some to finish.
             yield_now().await;
         }
-
-        // wait for the flush to finish.
-        self.write_waiting.fetch_add(1, Ordering::AcqRel);
-        while self.flush_waiting.load(Ordering::Acquire) > 0 {
-            self.flush_done_notify.notified().await;
-        }
-        self.write_waiting.fetch_sub(1, Ordering::AcqRel);
 
         // 1. find write location.
         let start = Instant::now();
@@ -435,11 +420,9 @@ impl FileWriter {
     }
 
     async fn flush_to(self: &Arc<Self>, durability: Durability) -> Result<()> {
-        self.flush_waiting.fetch_add(1, Ordering::AcqRel);
-        defer!({
-            self.flush_waiting.fetch_sub(1, Ordering::AcqRel);
-            self.flush_done_notify.notify_waiters();
-        });
+        // Flushes are serialized, and start only after active writes have
+        // completed their SliceWriter state transition.
+        let _operation_guard = self.operation_lock.write().await;
 
         self.finish_local().await?;
         if durability == Durability::Remote {
@@ -522,12 +505,39 @@ impl FileWriter {
         if let Err(e) = self.finish().await {
             error!("failed to flush in close {e}");
         }
-        if self.ref_count.fetch_sub(1, Ordering::AcqRel) <= 1 {
-            // we are the last one, we can close the file writer.
-            self.cancel_token.cancel();
-            let dm = self.data_manager.upgrade().unwrap();
-            dm.file_writers.remove(&self.inode);
+
+        let Some(dm) = self.data_manager.upgrade() else {
+            error!(
+                "Ino({}) cannot close after data manager dropped",
+                self.inode
+            );
+            return;
         };
+        let Entry::Occupied(entry) = dm.file_writers.entry(self.inode) else {
+            error!("Ino({}) writer is missing while closing", self.inode);
+            return;
+        };
+        if !Arc::ptr_eq(entry.get(), self) {
+            error!(
+                "Ino({}) writer was replaced before its handle closed",
+                self.inode
+            );
+            return;
+        }
+
+        // Opening and last-close retirement both hold the same DashMap shard
+        // write lock. A new handle therefore either increments this writer
+        // before the last-close decision, or observes a vacant entry and gets
+        // a new writer after retirement.
+        let references = self.ref_count.load(Ordering::Acquire);
+        if references == 0 {
+            error!("Ino({}) writer reference count underflow", self.inode);
+            return;
+        }
+        if self.ref_count.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.cancel_token.cancel();
+            entry.remove();
+        }
     }
 
     #[cfg(test)]
@@ -1274,6 +1284,53 @@ mod tests {
     };
 
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_finishes_do_not_lose_slice_completion() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let mut meta_config = MetaConfig::default();
+        meta_config.with_dsn(&format!(
+            "rocksdb://:{}",
+            tempdir.path().join("meta").to_str().unwrap()
+        ));
+        let format = Format::default();
+        kiseki_meta::update_format(&meta_config.dsn, format.clone(), true).unwrap();
+        let meta_engine = kiseki_meta::open(meta_config).unwrap();
+        let (inode, _) = meta_engine
+            .create(
+                Arc::new(FuseContext::background()),
+                ROOT_INO,
+                "concurrent-finish",
+                0o600,
+                0,
+                0,
+            )
+            .await
+            .unwrap();
+        let data_manager = Arc::new(
+            DataManager::new(
+                format.chunk_size,
+                meta_engine,
+                new_memory_object_store(),
+                FileCacheConfig {
+                    stage_cache_dir: tempdir.path().join("stage"),
+                    max_stage_size:  ReadableSize((BLOCK_SIZE * 2) as u64),
+                    cache_ttl:       Duration::from_secs(3600),
+                },
+            )
+            .unwrap(),
+        );
+        let writer = data_manager.open_file_writer(inode, 0);
+        writer.write(0, b"concurrent flush").await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let (first, second) = tokio::join!(writer.finish(), writer.finish());
+            first.unwrap();
+            second.unwrap();
+        })
+        .await
+        .expect("concurrent finishes must not lose a slice completion notification");
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn flush_is_local_durable_while_fsync_requires_remote_durability() {

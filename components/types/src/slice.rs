@@ -216,6 +216,15 @@ impl Slice {
             Slice::Borrowed { size, .. } => *size,
         }) as usize
     }
+
+    /// Return the byte offset where this logical slice starts in its backing
+    /// object.
+    pub fn get_underlying_offset(&self) -> usize {
+        match self {
+            Slice::Owned { .. } => 0,
+            Slice::Borrowed { off, .. } => *off as usize,
+        }
+    }
 }
 
 pub const SLICE_BYTES: usize = 28;
