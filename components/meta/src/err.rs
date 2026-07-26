@@ -102,41 +102,19 @@ impl Error {
 pub mod model_err {
     use snafu::Snafu;
 
-    #[derive(Debug)]
-    pub enum ModelKind {
-        Attr,
-        DEntry,
-        Symlink,
-        Setting,
-        Counter,
-        ChunkSlices,
-        DirStat,
-        HardLinkCount,
-        Sustained,
-        DeleteInode,
-    }
-
+    /// Errors produced by the typed KV layer (`backend::kv`), which is generic
+    /// over the key type. `key` is the hex-encoded raw key, for diagnostics.
     #[derive(Debug, Snafu)]
     #[snafu(visibility(pub))]
     pub enum Error {
-        NotFound {
-            kind: ModelKind,
-            key:  String,
-        },
-        Corruption {
-            kind:   ModelKind,
-            key:    String,
-            source: bincode::Error,
-        },
-        CorruptionString {
-            kind:   ModelKind,
-            key:    String,
-            reason: String,
-        },
+        #[snafu(display("record not found: {key}"))]
+        Missing { key: String },
+        #[snafu(display("record corrupted: {key}: {reason}"))]
+        Corrupt { key: String, reason: String },
     }
 
     impl Error {
-        pub const fn is_not_found(&self) -> bool { matches!(self, Self::NotFound { .. }) }
+        pub const fn is_not_found(&self) -> bool { matches!(self, Self::Missing { .. }) }
     }
 }
 

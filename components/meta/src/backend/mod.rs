@@ -29,6 +29,7 @@ use tracing::debug;
 use crate::{backend::key::Counter, context::FuseContext, err::Result};
 
 pub mod key;
+pub(crate) mod kv;
 #[cfg(feature = "meta-rocksdb")]
 mod rocksdb;
 #[cfg(feature = "meta-rocksdb")]
