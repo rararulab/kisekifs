@@ -35,7 +35,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    Mount(MountArgs),
+    Mount(Box<MountArgs>),
     Umount(UmountArgs),
     Format(FormatArgs),
 }
@@ -43,7 +43,7 @@ enum Commands {
 fn main() -> Result<(), Whatever> {
     let cli = Cli::parse();
     match cli.commands {
-        Commands::Mount(mount_args) => mount_args.run(),
+        Commands::Mount(mount_args) => (*mount_args).run(),
         Commands::Umount(umount_args) => umount_args.run(),
         Commands::Format(format_args) => format_args.run(),
     }

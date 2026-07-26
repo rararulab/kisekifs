@@ -44,7 +44,7 @@ use kiseki_types::{
 use kiseki_utils::readable_size::ReadableSize;
 #[cfg(test)]
 use libc::EBADF;
-use snafu::{OptionExt, ResultExt};
+use snafu::OptionExt;
 use tokio::{
     sync::{Notify, RwLock, mpsc},
     task::yield_now,
@@ -55,45 +55,55 @@ use tracing::{Instrument, debug, error, instrument};
 
 use crate::{
     data_manager::DataManager,
-    err::{Error, JoinErrSnafu, LibcSnafu, Result},
+    err::{Error, LibcSnafu, MountDrainingSnafu, Result},
 };
 
 impl DataManager {
     /// Creates a new [FileWriter] for the file.
     /// All file handle share the single one [FileWriter].
-    pub(crate) fn open_file_writer(self: &Arc<Self>, ino: Ino, len: u64) -> Arc<FileWriter> {
-        let fw = self.file_writers.entry(ino).or_insert_with(|| {
-            let (tx, rx) = mpsc::channel(200);
-            let fw = FileWriter {
-                inode:                  ino,
-                length:                 AtomicUsize::new(len as usize),
-                chunk_writers:          Default::default(),
-                slice_flush_queue:      tx,
-                total_slice_writer_cnt: Arc::new(Default::default()),
-                cancel_token:           CancellationToken::new(),
-                seq_generate:           self.id_generator.clone(),
-                ref_count:              Arc::new(Default::default()),
-                operation_lock:         Default::default(),
-                pattern:                Default::default(),
-                early_flush_threshold:  0.3,
-                flush_error:            Mutex::new(None),
-                published_slices:       Mutex::new(HashSet::new()),
-                data_manager:           Arc::downgrade(self),
-            };
-
-            let fw = Arc::new(fw);
-            let fw_cloned = fw.clone();
-            tokio::spawn(async move {
-                let flusher = FileWriterFlusher {
-                    fw:       fw_cloned,
-                    flush_rx: rx,
+    pub(crate) fn open_file_writer(
+        self: &Arc<Self>,
+        ino: Ino,
+        len: u64,
+    ) -> Result<Arc<FileWriter>> {
+        let fw = match self.file_writers.entry(ino) {
+            Entry::Occupied(entry) => entry.get().clone(),
+            Entry::Vacant(entry) => {
+                let (tx, rx) = mpsc::channel(200);
+                let fw = FileWriter {
+                    inode:                  ino,
+                    length:                 AtomicUsize::new(len as usize),
+                    chunk_writers:          Default::default(),
+                    slice_flush_queue:      tx,
+                    total_slice_writer_cnt: Arc::new(Default::default()),
+                    cancel_token:           CancellationToken::new(),
+                    seq_generate:           self.id_generator.clone(),
+                    ref_count:              Arc::new(Default::default()),
+                    operation_lock:         Default::default(),
+                    pattern:                Default::default(),
+                    early_flush_threshold:  0.3,
+                    flush_error:            Mutex::new(None),
+                    published_slices:       Mutex::new(HashSet::new()),
+                    data_manager:           Arc::downgrade(self),
                 };
-                flusher.run().await;
-            });
-            fw
-        });
+
+                let fw = Arc::new(fw);
+                let fw_cloned = fw.clone();
+                if !self.tasks.spawn(async move {
+                    let flusher = FileWriterFlusher {
+                        fw:       fw_cloned,
+                        flush_rx: rx,
+                    };
+                    flusher.run().await;
+                }) {
+                    return MountDrainingSnafu.fail();
+                }
+                entry.insert(fw.clone());
+                fw
+            }
+        };
         fw.ref_count.fetch_add(1, Ordering::AcqRel);
-        fw.clone()
+        Ok(fw)
     }
 
     /// Use the [FileWriter] to write data to the file.
@@ -146,6 +156,33 @@ impl DataManager {
             debug!("{ino} file writer not exists, don't need to flush");
         }
         Ok(())
+    }
+
+    pub(crate) async fn flush_all_writers_local(&self) -> (usize, usize, Vec<String>) {
+        let writers = self
+            .file_writers
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect::<Vec<_>>();
+        let total = writers.len();
+        let mut flushed = 0;
+        let mut errors = Vec::new();
+        for writer in writers {
+            match writer.finish().await {
+                Ok(()) => flushed += 1,
+                Err(error) if errors.len() < 8 => {
+                    errors.push(format!("writer local flush failed: {error}"));
+                }
+                Err(_) => {}
+            }
+        }
+        (total, flushed, errors)
+    }
+
+    pub(crate) fn cancel_all_writers(&self) {
+        for writer in self.file_writers.iter() {
+            writer.cancel_token.cancel();
+        }
     }
 }
 
@@ -453,20 +490,18 @@ impl FileWriter {
         if read_guard.is_empty() {
             return Ok(());
         }
-        let handles = read_guard
+        let finishes = read_guard
             .values()
             .map(|cw| {
                 let cw = cw.clone();
-                tokio::spawn(async move {
+                async move {
                     cw.finish().await;
-                })
+                }
             })
             .collect::<Vec<_>>();
         drop(read_guard);
 
-        futures::future::try_join_all(handles)
-            .await
-            .context(JoinErrSnafu)?;
+        futures::future::join_all(finishes).await;
 
         // surface errors recorded by the background flush tasks that this
         // flush triggered, fsync-style. Keep the chunk writers so a later
@@ -848,6 +883,11 @@ impl SliceWriter {
         offset_of_chunk: usize,
         data_manager: Weak<DataManager>,
     ) -> Self {
+        let page_pool = data_manager
+            .upgrade()
+            .expect("data manager is dropped")
+            .page_pool
+            .clone();
         Self {
             chunk_index,
             chunk_writer: Arc::downgrade(cw),
@@ -855,7 +895,7 @@ impl SliceWriter {
             _internal_seq: seq,
             slice_id: AtomicU64::new(EMPTY_SLICE_ID),
             offset_of_chunk,
-            slice_buffer: RwLock::new(SliceBuffer::new()),
+            slice_buffer: RwLock::new(SliceBuffer::new(page_pool)),
             last_modified: AtomicCell::new(Instant::now()),
             data_manager,
         }
@@ -868,12 +908,30 @@ impl SliceWriter {
         offset: usize,
         data: &[u8],
     ) -> Result<usize> {
-        let written = self
-            .slice_buffer
-            .write()
-            .await
-            .write_at(offset, data)
-            .await?;
+        let write_result = {
+            let mut write_guard = self.slice_buffer.write().await;
+            write_guard.write_at(offset, data).await
+        };
+        let written = match write_result {
+            Ok(written) => written,
+            Err(error) => {
+                if let Err(state) = self.state.compare_exchange(
+                    SliceWriterState::Writing as u8,
+                    before_state as u8,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    error!(
+                        "{self} cannot roll back failed write from {:?}",
+                        SliceWriterState::from(state)
+                    );
+                }
+                if let Some(cw) = self.chunk_writer.upgrade() {
+                    cw.slice_done_notify.notify_one();
+                }
+                return Err(error.into());
+            }
+        };
         self.last_modified.store(Instant::now());
         let new_state = if written == 0 {
             before_state
@@ -1312,6 +1370,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::data_manager::new_test_page_pool;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn concurrent_finishes_do_not_lose_slice_completion() {
@@ -1345,10 +1404,12 @@ mod tests {
                     max_stage_size:  ReadableSize((BLOCK_SIZE * 2) as u64),
                     cache_ttl:       Duration::from_secs(3600),
                 },
+                MemCacheConfig::default(),
+                crate::data_manager::new_test_page_pool().await,
             )
             .unwrap(),
         );
-        let writer = data_manager.open_file_writer(inode, 0);
+        let writer = data_manager.open_file_writer(inode, 0).unwrap();
         writer.write(0, b"concurrent flush").await.unwrap();
 
         tokio::time::timeout(Duration::from_secs(3), async {
@@ -1386,6 +1447,7 @@ mod tests {
         let remote_dir = tempdir.path().join("remote");
         let stage_dir = tempdir.path().join("stage");
         let remote_storage = new_local_object_store(&remote_dir).unwrap();
+        let tasks = Arc::new(kiseki_storage::task_registry::MountTaskRegistry::new());
         let file_cache = Arc::new(
             FileCache::new(
                 FileCacheConfig {
@@ -1394,6 +1456,7 @@ mod tests {
                     cache_ttl:       Duration::from_secs(3600),
                 },
                 remote_storage.clone(),
+                tasks.clone(),
             )
             .unwrap(),
         );
@@ -1408,8 +1471,10 @@ mod tests {
                 MemCacheConfig::default(),
                 remote_storage.clone(),
             )),
+            page_pool: new_test_page_pool().await,
+            tasks,
         });
-        let writer = data_manager.open_file_writer(inode, 0);
+        let writer = data_manager.open_file_writer(inode, 0).unwrap();
         let data = b"failed fsync must remain retryable";
         writer.write(0, data).await.unwrap();
 
@@ -1525,6 +1590,7 @@ mod tests {
 
         let stage_dir = tempdir.path().join("stage");
         let remote_storage = new_memory_object_store();
+        let tasks = Arc::new(kiseki_storage::task_registry::MountTaskRegistry::new());
         let file_cache = Arc::new(
             FileCache::new(
                 FileCacheConfig {
@@ -1533,6 +1599,7 @@ mod tests {
                     cache_ttl:       Duration::from_secs(3600),
                 },
                 remote_storage.clone(),
+                tasks.clone(),
             )
             .unwrap(),
         );
@@ -1544,8 +1611,10 @@ mod tests {
             meta_engine: meta_engine.clone(),
             file_cache,
             mem_cache: Arc::new(MemCache::new(MemCacheConfig::default(), remote_storage)),
+            page_pool: new_test_page_pool().await,
+            tasks,
         });
-        let writer = data_manager.open_file_writer(inode, 0);
+        let writer = data_manager.open_file_writer(inode, 0).unwrap();
         let data = vec![0x5A; BLOCK_SIZE];
         writer.write(0, &data).await.unwrap();
 
@@ -1692,6 +1761,8 @@ mod tests {
                     max_stage_size:  ReadableSize((BLOCK_SIZE * 2) as u64),
                     cache_ttl:       Duration::from_secs(3600),
                 },
+                MemCacheConfig::default(),
+                crate::data_manager::new_test_page_pool().await,
             )
             .unwrap(),
         );
@@ -1754,6 +1825,8 @@ mod tests {
                     max_stage_size:  ReadableSize((BLOCK_SIZE * 2) as u64),
                     cache_ttl:       Duration::from_secs(3600),
                 },
+                MemCacheConfig::default(),
+                crate::data_manager::new_test_page_pool().await,
             )
             .unwrap(),
         );
@@ -1804,10 +1877,12 @@ mod tests {
                     max_stage_size:  ReadableSize((BLOCK_SIZE * 2) as u64),
                     cache_ttl:       Duration::from_secs(3600),
                 },
+                MemCacheConfig::default(),
+                crate::data_manager::new_test_page_pool().await,
             )
             .unwrap(),
         );
-        let writer = data_manager.open_file_writer(inode, 0);
+        let writer = data_manager.open_file_writer(inode, 0).unwrap();
         writer
             .write(0, b"published bytes survive process death")
             .await

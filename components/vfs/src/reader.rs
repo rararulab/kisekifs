@@ -523,6 +523,7 @@ mod tests {
                     ..Default::default()
                 },
                 remote.clone(),
+                Arc::new(kiseki_storage::task_registry::MountTaskRegistry::new()),
             )
             .unwrap(),
         );
@@ -564,6 +565,7 @@ mod tests {
                     ..Default::default()
                 },
                 remote.clone(),
+                Arc::new(kiseki_storage::task_registry::MountTaskRegistry::new()),
             )
             .unwrap(),
         );
@@ -619,10 +621,12 @@ mod tests {
                     stage_cache_dir: tempdir.path().join("stage"),
                     ..Default::default()
                 },
+                kiseki_storage::cache::mem_cache::Config::default(),
+                crate::data_manager::new_test_page_pool().await,
             )
             .unwrap(),
         );
-        let writer = data_manager.open_file_writer(inode, 0);
+        let writer = data_manager.open_file_writer(inode, 0).unwrap();
 
         for (offset, data) in [
             (0, b"0123456789".as_slice()),
@@ -664,11 +668,13 @@ mod tests {
                     stage_cache_dir: stage_dir.path().to_path_buf(),
                     ..Default::default()
                 },
+                kiseki_storage::cache::mem_cache::Config::default(),
+                crate::data_manager::new_test_page_pool().await,
             )
             .unwrap(),
         );
 
-        data_manager.open_file_writer(inode, 0);
+        data_manager.open_file_writer(inode, 0).unwrap();
         let data = b"hello world" as &[u8];
 
         let write_len = data_manager
@@ -743,11 +749,13 @@ mod tests {
                     stage_cache_dir: tempdir.path().join("stage"),
                     ..Default::default()
                 },
+                kiseki_storage::cache::mem_cache::Config::default(),
+                crate::data_manager::new_test_page_pool().await,
             )
             .unwrap(),
         );
 
-        data_manager.open_file_writer(inode, 0);
+        data_manager.open_file_writer(inode, 0).unwrap();
         let step_size: usize = 4 << 20;
         let total_step: usize = 1 << (30 / step_size);
         let data = vec![1u8; step_size];

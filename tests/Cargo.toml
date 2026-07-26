@@ -12,5 +12,6 @@ rangemap = "1.6.0"
 libc.workspace = true
 rustix = { workspace = true, features = ["fs"] }
 serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
 tempfile.workspace = true
 toml = "0.8.23"

@@ -37,6 +37,27 @@ pub enum Error {
         source:   kiseki_utils::object_storage::ObjectStorageConfigError,
     },
 
+    #[snafu(display("invalid mount configuration: {reason}"))]
+    InvalidConfig {
+        reason:   String,
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("mount is draining and no longer accepts background work"))]
+    MountDraining {
+        #[snafu(implicit)]
+        location: Location,
+    },
+
+    #[snafu(display("failed to prepare cache root {}: {source}", path.display()))]
+    CacheRoot {
+        path:     std::path::PathBuf,
+        #[snafu(implicit)]
+        location: Location,
+        source:   std::io::Error,
+    },
+
     ObjectBlockNotFound {
         #[snafu(implicit)]
         location: Location,
@@ -100,6 +121,7 @@ impl kiseki_types::ToErrno for Error {
                 error!("meta error: {source}");
                 source.to_errno()
             }
+            Self::Storage { source } if source.is_no_space() => libc::ENOSPC,
             _ => {
                 // a panic here would wedge the FUSE mount; EIO is the honest
                 // fallback for storage/join errors without a precise mapping.

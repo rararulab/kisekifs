@@ -2,10 +2,15 @@ use std::{
     env,
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
+    net::TcpListener,
     os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt, symlink},
     path::{Path, PathBuf},
     process::{Child, Command, Output, Stdio},
-    sync::{Arc, Barrier, mpsc},
+    sync::{
+        Arc, Barrier,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc,
+    },
     thread,
     time::{Duration, Instant, UNIX_EPOCH},
 };
@@ -17,14 +22,16 @@ const READY_TIMEOUT: Duration = Duration::from_secs(15);
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 const BLOCK_SIZE: usize = 4 << 20;
+const PAGE_SIZE: usize = 128 << 10;
 const CHUNK_SIZE: u64 = 64 << 20;
 
 struct TestEnv {
     root:    TempDir,
     meta:    PathBuf,
     objects: PathBuf,
-    stage:   PathBuf,
+    cache:   PathBuf,
     mount:   PathBuf,
+    ready:   PathBuf,
     log:     PathBuf,
 }
 
@@ -46,10 +53,11 @@ impl TestEnv {
         };
         let meta = root.path().join("meta");
         let objects = root.path().join("objects");
-        let stage = root.path().join("stage");
+        let cache = root.path().join("cache");
         let mount = root.path().join("mount");
+        let ready = root.path().join("ready.json");
         let log = root.path().join("mount.log");
-        for path in [&meta, &objects, &stage, &mount] {
+        for path in [&meta, &objects, &cache, &mount] {
             fs::create_dir(path)
                 .unwrap_or_else(|error| panic!("create isolated path {}: {error}", path.display()));
         }
@@ -58,8 +66,9 @@ impl TestEnv {
             root,
             meta,
             objects,
-            stage,
+            cache,
             mount,
+            ready,
             log,
         };
         env.assert_owned(&env.mount);
@@ -72,6 +81,8 @@ impl TestEnv {
     fn meta_dsn(&self) -> String { format!("rocksdb://:{}", self.meta.display()) }
 
     fn object_dsn(&self) -> String { format!("file://{}", self.objects.display()) }
+
+    fn stage_dir(&self) -> PathBuf { self.cache.join("stage") }
 
     fn assert_owned(&self, path: &Path) {
         let root = self.root().canonicalize().expect("canonical test root");
@@ -96,6 +107,46 @@ impl TestEnv {
         MountGuard::spawn(self, read_only, &self.object_dsn())
     }
 
+    fn mount_with_page_limits(
+        &self,
+        memory_capacity: &str,
+        disk_capacity: Option<&str>,
+    ) -> MountGuard {
+        MountGuard::spawn_with_limits(
+            self,
+            false,
+            &self.object_dsn(),
+            Some(memory_capacity),
+            disk_capacity,
+            None,
+            None,
+        )
+    }
+
+    fn mount_with_stage_limit(&self, stage_capacity: &str) -> MountGuard {
+        MountGuard::spawn_with_limits(
+            self,
+            false,
+            &self.object_dsn(),
+            None,
+            None,
+            Some(stage_capacity),
+            None,
+        )
+    }
+
+    fn mount_with_shutdown_deadline(&self, shutdown_deadline: &str) -> MountGuard {
+        MountGuard::spawn_with_limits(
+            self,
+            false,
+            &self.object_dsn(),
+            None,
+            None,
+            None,
+            Some(shutdown_deadline),
+        )
+    }
+
     fn invalid_mount_output(&self) -> Output {
         Command::new(kiseki_binary())
             .args([
@@ -110,9 +161,11 @@ impl TestEnv {
                 &self.meta_dsn(),
                 "--object-storage",
                 "file://relative/path",
-                "--stage-cache-dir",
+                "--cache-dir",
             ])
-            .arg(&self.stage)
+            .arg(&self.cache)
+            .args(["--ready-file"])
+            .arg(&self.ready)
             .arg(&self.mount)
             .env("KISEKI_DISABLE_DISK_POOL", "1")
             .output()
@@ -125,10 +178,23 @@ struct MountGuard {
     mount_point: PathBuf,
     owned_root:  PathBuf,
     log_path:    PathBuf,
+    ready_path:  PathBuf,
 }
 
 impl MountGuard {
     fn spawn(env: &TestEnv, read_only: bool, object_dsn: &str) -> Self {
+        Self::spawn_with_limits(env, read_only, object_dsn, None, None, None, None)
+    }
+
+    fn spawn_with_limits(
+        env: &TestEnv,
+        read_only: bool,
+        object_dsn: &str,
+        memory_capacity: Option<&str>,
+        disk_capacity: Option<&str>,
+        stage_capacity: Option<&str>,
+        shutdown_deadline: Option<&str>,
+    ) -> Self {
         env.assert_owned(&env.mount);
         let log = OpenOptions::new()
             .create(true)
@@ -150,9 +216,11 @@ impl MountGuard {
                 &env.meta_dsn(),
                 "--object-storage",
                 object_dsn,
-                "--stage-cache-dir",
+                "--cache-dir",
             ])
-            .arg(&env.stage)
+            .arg(&env.cache)
+            .args(["--ready-file"])
+            .arg(&env.ready)
             .arg(&env.mount)
             .env("KISEKI_DISABLE_DISK_POOL", "1")
             .env_remove("PYROSCOPE_SERVER_URL")
@@ -161,12 +229,25 @@ impl MountGuard {
         if read_only {
             command.arg("--read-only");
         }
+        if let Some(memory_capacity) = memory_capacity {
+            command.args(["--memory-page-capacity", memory_capacity]);
+        }
+        if let Some(disk_capacity) = disk_capacity {
+            command.args(["--disk-page-capacity", disk_capacity]);
+        }
+        if let Some(stage_capacity) = stage_capacity {
+            command.args(["--stage-cache-capacity", stage_capacity]);
+        }
+        if let Some(shutdown_deadline) = shutdown_deadline {
+            command.args(["--shutdown-deadline", shutdown_deadline]);
+        }
         let child = command.spawn().expect("spawn kiseki mount");
         let mut guard = Self {
             child:       Some(child),
             mount_point: env.mount.clone(),
             owned_root:  env.root().to_path_buf(),
             log_path:    env.log.clone(),
+            ready_path:  env.ready.clone(),
         };
         if let Err(error) = guard.wait_ready() {
             let logs = guard.log_tail();
@@ -180,8 +261,12 @@ impl MountGuard {
 
     fn wait_ready(&mut self) -> Result<(), String> {
         let deadline = Instant::now() + READY_TIMEOUT;
+        let child_pid = self.pid();
         loop {
-            if is_mounted(&self.mount_point) && fs::read_dir(&self.mount_point).is_ok() {
+            if is_mounted(&self.mount_point)
+                && fs::read_dir(&self.mount_point).is_ok()
+                && ready_file_belongs_to(&self.ready_path, child_pid)
+            {
                 return Ok(());
             }
             if let Some(status) = self
@@ -211,6 +296,48 @@ impl MountGuard {
         }
     }
 
+    fn terminate(self) { self.signal_and_wait("-TERM", true); }
+
+    fn interrupt(self) { self.signal_and_wait("-INT", true); }
+
+    fn terminate_unclean(self) { self.signal_and_wait("-TERM", false); }
+
+    fn signal_and_wait(mut self, signal: &str, expect_success: bool) {
+        let pid = self.pid();
+        let status = Command::new("kill")
+            .args([signal, &pid.to_string()])
+            .status()
+            .unwrap_or_else(|error| panic!("send {signal} to mount child: {error}"));
+        assert!(status.success(), "failed to send {signal} to {pid}");
+
+        let mut child = self.child.take().expect("mount child is present");
+        let deadline = Instant::now() + STOP_TIMEOUT;
+        let exit_status = loop {
+            if let Some(status) = child.try_wait().expect("poll terminated mount child") {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                child
+                    .kill()
+                    .unwrap_or_else(|error| panic!("kill mount after {signal} timeout: {error}"));
+                child.wait().expect("reap timed out mount child");
+                panic!("mount child {pid} did not exit after {signal}");
+            }
+            thread::sleep(POLL_INTERVAL);
+        };
+        assert_eq!(
+            exit_status.success(),
+            expect_success,
+            "{signal} mount exit was {exit_status}"
+        );
+        wait_until(STOP_TIMEOUT, || !is_mounted(&self.mount_point))
+            .unwrap_or_else(|error| panic!("mount remained after {signal}: {error}"));
+        assert!(
+            !self.ready_path.exists(),
+            "ready file remained after {signal}"
+        );
+    }
+
     fn kill(mut self) {
         let pid = self.pid();
         let child = self.child.as_mut().expect("mount child is present");
@@ -232,6 +359,13 @@ impl MountGuard {
             !process_exists(pid),
             "killed mount child {pid} still exists"
         );
+        assert!(
+            self.ready_path.is_file(),
+            "SIGKILL should leave the dead process ready record for recovery"
+        );
+        // The next mount must reclaim this dead owner's ready file. Disarm
+        // this guard's normal clean-shutdown assertion without deleting it.
+        self.ready_path = self.owned_root.join(".released-ready-guard");
     }
 
     fn cleanup(&mut self) -> Result<(), String> {
@@ -276,6 +410,12 @@ impl MountGuard {
             return Err(format!(
                 "mount remains: {}",
                 mountinfo_entry(&self.mount_point).unwrap_or_default()
+            ));
+        }
+        if self.ready_path.exists() {
+            return Err(format!(
+                "ready file remains after shutdown: {}",
+                self.ready_path.display()
             ));
         }
         Ok(())
@@ -400,6 +540,14 @@ fn fusermount(mount_point: &Path, lazy: bool) -> Result<(), String> {
 }
 
 fn process_exists(pid: u32) -> bool { Path::new(&format!("/proc/{pid}")).exists() }
+
+fn ready_file_belongs_to(path: &Path, pid: u32) -> bool {
+    fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|payload| payload.get("pid").and_then(serde_json::Value::as_u64))
+        == Some(pid as u64)
+}
 
 fn has_regular_file(root: &Path) -> bool {
     let Ok(entries) = fs::read_dir(root) else {
@@ -737,6 +885,182 @@ mod lifecycle {
         let output = env.invalid_mount_output();
         assert!(!output.status.success(), "invalid object storage mounted");
         assert!(!is_mounted(&env.mount));
+        assert!(!env.ready.exists(), "failed startup published readiness");
+    }
+
+    #[test]
+    #[ignore = "requires Linux /dev/fuse"]
+    fn sigterm_idle_drains_and_removes_readiness() {
+        let env = TestEnv::new("sigterm-idle");
+        let mount = env.mount(false);
+        assert!(env.ready.is_file());
+        mount.terminate();
+        assert!(!is_mounted(&env.mount));
+        assert!(!env.ready.exists());
+    }
+
+    #[test]
+    #[ignore = "requires Linux /dev/fuse"]
+    fn sigint_idle_drains_and_removes_readiness() {
+        let env = TestEnv::new("sigint-idle");
+        let mount = env.mount(false);
+        assert!(env.ready.is_file());
+        mount.interrupt();
+        assert!(!is_mounted(&env.mount));
+        assert!(!env.ready.exists());
+    }
+
+    #[test]
+    #[ignore = "requires Linux /dev/fuse"]
+    fn sigterm_preserves_locally_staged_data_during_remote_outage() {
+        let env = TestEnv::new("sigterm-stage");
+        let expected = pattern((1 << 20) + 53, 91);
+        let path = env.mount.join("locally-staged");
+        let mount = env.mount(false);
+
+        env.assert_owned(&env.objects);
+        fs::remove_dir(&env.objects).unwrap();
+        fs::write(&env.objects, b"block remote migration").unwrap();
+        let mut file = File::create(&path).unwrap();
+        file.write_all(&expected).unwrap();
+        file.flush().unwrap();
+        drop(file);
+        wait_until(READY_TIMEOUT, || has_regular_file(&env.stage_dir()))
+            .expect("local stage did not become durable before SIGTERM");
+        mount.terminate();
+
+        fs::remove_file(&env.objects).unwrap();
+        fs::create_dir(&env.objects).unwrap();
+        let mount = env.mount(false);
+        assert_eq!(fs::read(&path).unwrap(), expected);
+        mount.shutdown();
+    }
+
+    #[test]
+    #[ignore = "requires Linux /dev/fuse"]
+    fn simultaneous_mounts_keep_cache_roots_and_data_isolated() {
+        let first = TestEnv::new("two-mounts-a");
+        let second = TestEnv::new("two-mounts-b");
+        let first_mount = first.mount(false);
+        let second_mount = second.mount(false);
+
+        fs::write(first.mount.join("value"), b"first").unwrap();
+        fs::write(second.mount.join("value"), b"second").unwrap();
+        assert_eq!(fs::read(first.mount.join("value")).unwrap(), b"first");
+        assert_eq!(fs::read(second.mount.join("value")).unwrap(), b"second");
+        assert_ne!(first.cache, second.cache);
+        assert!(first.ready.is_file());
+        assert!(second.ready.is_file());
+
+        first_mount.shutdown();
+        assert!(is_mounted(&second.mount));
+        assert_eq!(fs::read(second.mount.join("value")).unwrap(), b"second");
+        second_mount.shutdown();
+    }
+
+    #[test]
+    #[ignore = "requires Linux /dev/fuse"]
+    fn exhausted_page_pool_returns_enospc_without_wedging_shutdown() {
+        let env = TestEnv::new("page-pressure");
+        let mount = env.mount_with_page_limits("128KiB", None);
+        let mut file = File::create(env.mount.join("pressure")).unwrap();
+        file.write_all(&vec![0xA5; PAGE_SIZE]).unwrap();
+        let error = file.write_all(b"x").unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ENOSPC));
+        drop(file);
+        mount.terminate();
+    }
+
+    #[test]
+    #[ignore = "requires Linux /dev/fuse"]
+    fn exhausted_memory_and_disk_page_pools_return_enospc() {
+        let env = TestEnv::new("combined-page-pressure");
+        let mount = env.mount_with_page_limits("128KiB", Some("128KiB"));
+        let mut file = File::create(env.mount.join("combined-pressure")).unwrap();
+        file.write_all(&vec![0xA5; PAGE_SIZE * 2]).unwrap();
+        let error = file.write_all(b"x").unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ENOSPC));
+        drop(file);
+        mount.terminate();
+    }
+
+    #[test]
+    #[ignore = "requires Linux /dev/fuse"]
+    fn forced_shutdown_timeout_is_bounded_and_exits_nonzero() {
+        let env = TestEnv::new("forced-shutdown-timeout");
+        let mount = env.mount_with_shutdown_deadline("1ns");
+        let mut file = File::create(env.mount.join("dirty")).unwrap();
+        file.write_all(&vec![0x5A; PAGE_SIZE]).unwrap();
+
+        mount.terminate_unclean();
+        drop(file);
+        assert!(!is_mounted(&env.mount));
+        assert!(!env.ready.exists());
+    }
+
+    #[test]
+    #[ignore = "requires Linux /dev/fuse"]
+    fn full_stage_cache_applies_backpressure_and_recovers_after_remote_outage() {
+        let env = TestEnv::new("stage-pressure");
+        let mount = env.mount_with_stage_limit("2MiB");
+        env.assert_owned(&env.objects);
+        fs::remove_dir(&env.objects).unwrap();
+        fs::write(&env.objects, b"block remote migration").unwrap();
+
+        let mut first = File::create(env.mount.join("fills-stage")).unwrap();
+        first.write_all(&vec![0x4D; (1 << 20) + 53]).unwrap();
+        drop(first);
+        wait_until(READY_TIMEOUT, || has_regular_file(&env.stage_dir()))
+            .expect("first block did not fill the stage cache");
+
+        let mut second = File::create(env.mount.join("backpressured")).unwrap();
+        second.write_all(&vec![0xB2; (1 << 20) + 53]).unwrap();
+        assert_errno(
+            second.sync_all(),
+            libc::ENOSPC,
+            "fsync into full stage cache",
+        );
+
+        fs::remove_file(&env.objects).unwrap();
+        fs::create_dir(&env.objects).unwrap();
+        wait_until(READY_TIMEOUT, || second.sync_all().is_ok())
+            .expect("stage cache did not recover after remote storage returned");
+        drop(second);
+        mount.terminate();
+    }
+
+    #[test]
+    #[ignore = "requires Linux /dev/fuse"]
+    fn sigterm_during_active_writes_drains_without_deadlock() {
+        let env = TestEnv::new("sigterm-active-write");
+        let mount = env.mount(false);
+        let path = env.mount.join("active-write");
+        let started = Arc::new(Barrier::new(2));
+        let stop = Arc::new(AtomicBool::new(false));
+        let completed_writes = Arc::new(AtomicUsize::new(0));
+        let writer = {
+            let started = started.clone();
+            let stop = stop.clone();
+            let completed_writes = completed_writes.clone();
+            thread::spawn(move || {
+                let mut file = File::create(path).unwrap();
+                file.write_all(&vec![0xA7; PAGE_SIZE]).unwrap();
+                completed_writes.fetch_add(1, Ordering::Relaxed);
+                started.wait();
+                while !stop.load(Ordering::Relaxed) {
+                    if file.write_all(&vec![0xA7; PAGE_SIZE]).is_err() {
+                        break;
+                    }
+                    completed_writes.fetch_add(1, Ordering::Relaxed);
+                }
+            })
+        };
+        started.wait();
+        thread::sleep(Duration::from_millis(25));
+        mount.terminate();
+        stop.store(true, Ordering::Relaxed);
+        writer.join().unwrap();
+        assert!(completed_writes.load(Ordering::Relaxed) > 0);
     }
 
     #[test]
@@ -753,9 +1077,10 @@ mod lifecycle {
         drop(file);
         assert!(has_regular_file(&env.objects));
 
-        env.assert_owned(&env.stage);
-        fs::remove_dir_all(&env.stage).unwrap();
-        fs::create_dir(&env.stage).unwrap();
+        let stage_dir = env.stage_dir();
+        env.assert_owned(&stage_dir);
+        fs::remove_dir_all(&stage_dir).unwrap();
+        fs::create_dir(&stage_dir).unwrap();
 
         let mount = env.mount(false);
         assert_eq!(fs::read(&path).unwrap(), expected);
@@ -777,7 +1102,7 @@ mod lifecycle {
         file.write_all(&expected).unwrap();
         file.flush().unwrap();
         drop(file);
-        wait_until(READY_TIMEOUT, || has_regular_file(&env.stage))
+        wait_until(READY_TIMEOUT, || has_regular_file(&env.stage_dir()))
             .expect("local stage did not become durable");
         mount.kill();
 
@@ -785,7 +1110,115 @@ mod lifecycle {
         fs::create_dir(&env.objects).unwrap();
         let mount = env.mount(false);
         assert_eq!(fs::read(&path).unwrap(), expected);
+        wait_until(READY_TIMEOUT, || !has_regular_file(&env.stage_dir()))
+            .expect("recovered migration worker did not drain the staged block");
         mount.shutdown();
+    }
+
+    #[test]
+    #[ignore = "requires Linux /dev/fuse"]
+    fn overlapping_file_storage_is_rejected_without_touching_the_object() {
+        let env = TestEnv::new("path-overlap");
+        let stage = env.stage_dir();
+        fs::create_dir(&stage).unwrap();
+        let victim = stage.join("sole-object");
+        fs::write(&victim, b"preserve me").unwrap();
+        let output = Command::new(kiseki_binary())
+            .args([
+                "mount",
+                "--foreground",
+                "--no-log",
+                "--auto-unmount",
+                "false",
+                "--allow-other",
+                "false",
+                "--meta-dsn",
+                &env.meta_dsn(),
+                "--object-storage",
+                &format!("file://{}", stage.display()),
+                "--cache-dir",
+            ])
+            .arg(&env.cache)
+            .args(["--ready-file"])
+            .arg(&env.ready)
+            .arg(&env.mount)
+            .output()
+            .expect("run overlapping mount");
+
+        assert!(!output.status.success(), "overlapping storage mounted");
+        assert_eq!(fs::read(&victim).unwrap(), b"preserve me");
+        assert!(!is_mounted(&env.mount));
+        assert!(!env.ready.exists());
+    }
+
+    #[test]
+    #[ignore = "requires Linux /dev/fuse"]
+    fn signal_cancels_a_delayed_object_probe_before_mounting() {
+        let env = TestEnv::new("startup-signal");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let object_dsn = format!(
+            "s3://delayed-probe?region=test&endpoint=http%3A%2F%2F127.0.0.1%3A{port}&\
+             allow_http=true"
+        );
+        let log = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&env.log)
+            .unwrap();
+        let stderr = log.try_clone().unwrap();
+        let mut child = Command::new(kiseki_binary())
+            .args([
+                "mount",
+                "--foreground",
+                "--no-log",
+                "--auto-unmount",
+                "false",
+                "--allow-other",
+                "false",
+                "--meta-dsn",
+                &env.meta_dsn(),
+                "--object-storage",
+                &object_dsn,
+                "--cache-dir",
+            ])
+            .arg(&env.cache)
+            .args(["--ready-file"])
+            .arg(&env.ready)
+            .arg(&env.mount)
+            .env("AWS_ACCESS_KEY_ID", "mounted-test")
+            .env("AWS_SECRET_ACCESS_KEY", "mounted-test-secret")
+            .stdout(Stdio::from(log))
+            .stderr(Stdio::from(stderr))
+            .spawn()
+            .unwrap();
+
+        let connection = loop {
+            match listener.accept() {
+                Ok((connection, _)) => break connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        child.try_wait().unwrap().is_none(),
+                        "probe process exited early"
+                    );
+                    thread::sleep(POLL_INTERVAL);
+                }
+                Err(error) => panic!("accept delayed object probe: {error}"),
+            }
+        };
+        let status = Command::new("kill")
+            .args(["-TERM", &child.id().to_string()])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        wait_until(STOP_TIMEOUT, || child.try_wait().unwrap().is_some())
+            .expect("startup probe did not stop after SIGTERM");
+        let exit = child.wait().unwrap();
+        drop(connection);
+        assert!(exit.success(), "startup cancellation exited with {exit}");
+        assert!(!is_mounted(&env.mount));
+        assert!(!env.ready.exists());
     }
 }
 

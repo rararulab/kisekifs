@@ -9,6 +9,7 @@ HOME_DIR := env_var('HOME')
 CARGO_REGISTRY_CACHE := HOME_DIR + "/.cargo/registry"
 PWD := invocation_directory()
 OBJECT_STORAGE_DSN := env_var_or_default("KISEKI_OBJECT_STORAGE_DSN", "file:///tmp/kiseki.data")
+CACHE_DIR := env_var_or_default("KISEKI_CACHE_DIR", "/tmp/kiseki.cache")
 
 @env:
     echo "RUST_TOOLCHAIN: {{RUST_TOOLCHAIN}}"
@@ -84,17 +85,17 @@ alias sh-m := help-mount
 @mount:
     just clean
     just prepare
-    cargo run --color=always --package kiseki-binary mount --level debug --object-storage "{{OBJECT_STORAGE_DSN}}"
+    cargo run --color=always --package kiseki-binary mount --level debug --object-storage "{{OBJECT_STORAGE_DSN}}" --cache-dir "{{CACHE_DIR}}"
 
 @release-mount:
     just clean
     just prepare
-    cargo run --release --color=always --package kiseki-binary mount --no-log --object-storage "{{OBJECT_STORAGE_DSN}}"
+    cargo run --release --color=always --package kiseki-binary mount --no-log --object-storage "{{OBJECT_STORAGE_DSN}}" --cache-dir "{{CACHE_DIR}}"
 
 @profile-mount:
     just clean
     just prepare
-    cargo flamegraph --package kiseki-binary -- mount --no-log --object-storage "{{OBJECT_STORAGE_DSN}}"
+    cargo flamegraph --package kiseki-binary -- mount --no-log --object-storage "{{OBJECT_STORAGE_DSN}}" --cache-dir "{{CACHE_DIR}}"
 
 # ==================================================== umount
 
@@ -133,8 +134,6 @@ alias sh-f := help-format
     echo "Done: remove meta dir"
     - rm -r /tmp/kiseki.cache/
     echo "Done: remove cache dir"
-    - rm -r /tmp/kiseki.stage_cache/
-    echo "Done: remove stage cache dir"
     - rm -r /tmp/kiseki.data/
     echo "Done: remove data dir"
     - rm -r /tmp/kiseki.log/

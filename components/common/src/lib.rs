@@ -24,8 +24,6 @@ pub const MODE_MASK_X: u8 = 0b001;
 
 pub const KISEKI: &str = "kiseki";
 pub const KISEKI_DEBUG_META_ADDR: &str = "rocksdb://:/tmp/kiseki.meta";
-pub const KISEKI_DEBUG_STAGE_CACHE: &str = "/tmp/kiseki.stage_cache";
-pub const KISEKI_DEBUG_CACHE: &str = "/tmp/kiseki.cache";
 pub const PAGE_BUFFER_SIZE: usize = 300 << 20;
 // 300MiB
 // pub const PAGE_SIZE: usize = 64 << 10;

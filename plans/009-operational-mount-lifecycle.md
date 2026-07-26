@@ -13,13 +13,36 @@
 
 ## Status
 
-- **State**: TODO
+- **State**: DONE
 - **Priority**: P1
 - **Effort**: L
 - **Risk**: MED
 - **Depends on**: `plans/006-crash-consistent-write-publication.md`, `plans/007-safe-buffer-data-path.md`, `plans/008-mounted-linux-acceptance.md`
 - **Category**: correctness / tech-debt / dx
 - **Planned at**: commit `2fb2c95`, 2026-07-20
+
+### Completion evidence at 2026-07-26
+
+Implemented mount-scoped page pools, cache roots and task ownership; validated
+resource limits and stored layout; bounded idempotent shutdown reports; shared
+FUSE destroy/signal drain semantics; truthful owner-aware readiness; bounded
+telemetry shutdown; stage/page pressure backpressure; and the operator runbook.
+
+Final verification on `rara-linux`:
+
+- `KISEKI_DISABLE_DISK_POOL=1 cargo nextest run -p kiseki-storage -p kiseki-vfs -p kiseki-fuse -p kiseki-binary`
+- `KISEKI_DISABLE_DISK_POOL=1 cargo nextest run --workspace --all-features`
+- `tests/scripts/run-mounted.sh` and `tests/scripts/run-mounted.sh --case lifecycle`
+- `cargo check --all --all-features`
+- `cargo clippy --workspace --all-targets --all-features --no-deps -- -D warnings`
+- `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --document-private-items`
+- `cargo +nightly fmt --all -- --check` and `git diff --check`
+- a real mount with an unreachable OTLP endpoint, followed by bounded clean
+  `SIGTERM` exit and ready-file removal
+
+The final workspace run passed 179/179 tests (22 skipped mounted/specialized
+cases), the real FUSE gate passed 20/20, and an independent second-round review
+returned `APPROVE` after the path-isolation and ready-file race fixes.
 
 ## Why this matters
 
@@ -251,17 +274,17 @@ cases and the runbook commands match the current CLI help.
 
 ## Done criteria
 
-- [ ] No global page/cache singleton or fixed production `/tmp/kiseki.*` path
+- [x] No global page/cache singleton or fixed production `/tmp/kiseki.*` path
       remains.
-- [ ] Runtime buffer/cache settings are validated and actually used.
-- [ ] Every background task is owned, cancellable at a safe point, and joined.
-- [ ] SIGINT, SIGTERM, external unmount, and FUSE destroy share one idempotent
+- [x] Runtime buffer/cache settings are validated and actually used.
+- [x] Every background task is owned, cancellable at a safe point, and joined.
+- [x] SIGINT, SIGTERM, external unmount, and FUSE destroy share one idempotent
       drain path.
-- [ ] Readiness is truthful, atomic, non-secret, and cleaned safely.
-- [ ] Lifecycle logs/reports are structured and bounded.
-- [ ] Two simultaneous mounts are resource-isolated.
-- [ ] Mounted lifecycle, workspace, check, lint, and format gates pass.
-- [ ] Operator runbook and `plans/README.md` are updated.
+- [x] Readiness is truthful, atomic, non-secret, and cleaned safely.
+- [x] Lifecycle logs/reports are structured and bounded.
+- [x] Two simultaneous mounts are resource-isolated.
+- [x] Mounted lifecycle, workspace, check, lint, and format gates pass.
+- [x] Operator runbook and `plans/README.md` are updated.
 
 ## STOP conditions
 

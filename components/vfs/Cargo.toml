@@ -19,6 +19,7 @@ crossbeam-queue.workspace = true
 dashmap.workspace = true
 fuser.workspace = true
 futures.workspace = true
+fs4.workspace = true
 libc.workspace = true
 rangemap.workspace = true
 scopeguard.workspace = true

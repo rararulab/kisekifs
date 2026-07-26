@@ -38,7 +38,10 @@ use std::{
     cmp::min,
     collections::HashMap,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -51,12 +54,16 @@ use kiseki_utils::{
 };
 use snafu::{ResultExt, ensure};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
-use tokio_util::io::StreamReader;
+use tokio_util::{io::StreamReader, sync::CancellationToken};
 use tracing::{debug, error, warn};
 
 use crate::{
-    err::{Error::CacheError, FlushBlockFailedSnafu, ObjectStorageSnafu, Result, UnknownIOSnafu},
+    err::{
+        ErrStageNoMoreSpaceSnafu, Error::CacheError, FlushBlockFailedSnafu, ObjectStorageSnafu,
+        Result, UnknownIOSnafu,
+    },
     pool::Page,
+    task_registry::MountTaskRegistry,
 };
 
 pub const DEFAULT_STAGE_CACHE_SIZE: u64 = 10 << 30;
@@ -76,7 +83,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            stage_cache_dir: PathBuf::from(kiseki_common::KISEKI_DEBUG_STAGE_CACHE),
+            stage_cache_dir: PathBuf::new(),
             max_stage_size:  ReadableSize(DEFAULT_STAGE_CACHE_SIZE),
             cache_ttl:       DEFAULT_CACHE_TTL,
         }
@@ -88,41 +95,73 @@ pub type FileCacheRef = Arc<FileCache>;
 pub struct FileCache {
     /// Authoritative index for locally readable staged blocks. Unlike the
     /// policy cache below, entries stay here until remote migration succeeds.
-    staged_index:   Arc<tokio::sync::RwLock<HashMap<SliceKey, CacheIndex>>>,
+    staged_index:              Arc<tokio::sync::RwLock<HashMap<SliceKey, CacheIndex>>>,
     /// TTL/capacity policy only. Eviction schedules migration but does not own
     /// the staged block's readable lifetime.
-    index:          moka::future::Cache<SliceKey, CacheIndex>,
-    remote_storage: ObjectStorage,
-    local_storage:  LocalStorage,
+    index:                     moka::future::Cache<SliceKey, CacheIndex>,
+    remote_storage:            ObjectStorage,
+    local_storage:             LocalStorage,
+    tasks:                     Arc<MountTaskRegistry>,
+    staged_bytes:              Arc<AtomicU64>,
+    pressure_migration_active: Arc<AtomicBool>,
+    max_stage_size:            u64,
+    stage_dir:                 PathBuf,
 }
 
 impl FileCache {
-    pub fn new(config: Config, remote_storage: ObjectStorage) -> Result<Self> {
-        // TODO: flush all the staged data to the remote storage at the beginning.
+    pub fn new(
+        config: Config,
+        remote_storage: ObjectStorage,
+        tasks: Arc<MountTaskRegistry>,
+    ) -> Result<Self> {
+        if !config.stage_cache_dir.is_absolute() {
+            return Err(CacheError {
+                error: "stage cache directory must be an absolute path".to_string(),
+            });
+        }
 
         let local_storage =
             kiseki_utils::object_storage::new_local_object_store(&config.stage_cache_dir)
                 .context(ObjectStorageSnafu)?;
         let recovered = recover_stage_index(&config.stage_cache_dir)?;
+        let recovered_bytes = recovered
+            .values()
+            .map(|entry| entry.slice_key.block_size as u64)
+            .sum();
+        let staged_bytes = Arc::new(AtomicU64::new(recovered_bytes));
         let recovered_entries = recovered.values().cloned().collect::<Vec<_>>();
         let staged_index = Arc::new(tokio::sync::RwLock::new(recovered));
 
         let local_storage_clone = local_storage.clone();
         let remote_storage_clone = remote_storage.clone();
         let staged_index_clone = staged_index.clone();
+        let tasks_clone = tasks.clone();
+        let staged_bytes_clone = staged_bytes.clone();
         let eviction_listener =
             move |k: Arc<SliceKey>, v: CacheIndex, cause| -> moka::notification::ListenerFuture {
                 debug!("evicting block from the stage cache: {k:?}, reason: {cause:?}");
                 let local_storage = local_storage_clone.clone();
                 let remote_storage = remote_storage_clone.clone();
                 let staged_index = staged_index_clone.clone();
+                let tasks = tasks_clone.clone();
+                let staged_bytes = staged_bytes_clone.clone();
                 // Create a Future that removes the block from the local storage and
                 // flushes it to the remote storage.
                 //
                 // Convert the regular Future into ListenerFuture. This method is
                 // provided by moka::future::FutureExt trait.
                 moka::future::FutureExt::boxed(async move {
-                    migrate_with_retry(local_storage, remote_storage, staged_index, v).await;
+                    let cancellation = tasks.cancellation_token();
+                    if !tasks.spawn(migrate_with_retry(
+                        local_storage,
+                        remote_storage,
+                        staged_index,
+                        staged_bytes,
+                        v,
+                        cancellation,
+                    )) {
+                        warn!("stage migration rejected because the mount is draining");
+                    }
                 })
             };
 
@@ -141,16 +180,24 @@ impl FileCache {
             .async_eviction_listener(eviction_listener)
             .build();
 
-        let runtime = tokio::runtime::Handle::try_current().map_err(|error| CacheError {
-            error: format!("file cache requires a Tokio runtime: {error}"),
-        })?;
         for entry in recovered_entries {
             let local_storage = local_storage.clone();
             let remote_storage = remote_storage.clone();
             let staged_index = staged_index.clone();
-            runtime.spawn(async move {
-                migrate_with_retry(local_storage, remote_storage, staged_index, entry).await;
-            });
+            let staged_bytes = staged_bytes.clone();
+            let cancellation = tasks.cancellation_token();
+            if !tasks.spawn(migrate_with_retry(
+                local_storage,
+                remote_storage,
+                staged_index,
+                staged_bytes,
+                entry,
+                cancellation,
+            )) {
+                return Err(CacheError {
+                    error: "recovered stage migration rejected during startup".to_string(),
+                });
+            }
         }
 
         Ok(Self {
@@ -158,6 +205,11 @@ impl FileCache {
             index,
             remote_storage,
             local_storage,
+            tasks,
+            staged_bytes,
+            pressure_migration_active: Arc::new(AtomicBool::new(false)),
+            max_stage_size: config.max_stage_size.as_bytes(),
+            stage_dir: config.stage_cache_dir,
         })
     }
 
@@ -170,7 +222,7 @@ impl FileCache {
             Ok(reader) => Ok(Some(reader)),
             Err(error) if kiseki_utils::object_storage::is_not_found_error(&error) => {
                 if self.remote_block_is_confirmed(slice_key).await? {
-                    self.staged_index.write().await.remove(slice_key);
+                    self.remove_staged(slice_key).await;
                     Ok(None)
                 } else {
                     FlushBlockFailedSnafu.fail()
@@ -203,7 +255,7 @@ impl FileCache {
             Ok(bytes) => Ok(Some(bytes)),
             Err(error) if kiseki_utils::object_storage::is_not_found_error(&error) => {
                 if self.remote_block_is_confirmed(slice_key).await? {
-                    self.staged_index.write().await.remove(slice_key);
+                    self.remove_staged(slice_key).await;
                     Ok(None)
                 } else {
                     FlushBlockFailedSnafu.fail()
@@ -223,7 +275,11 @@ impl FileCache {
         let key = SliceKey::new(sid, block_index, block_length);
         debug!("staging block: {key:?}");
         let total_release_page_cnt = pages.iter().filter(|page| page.is_some()).count();
-        let cache_index = self
+        if self.staged_index.read().await.contains_key(&key) {
+            return Ok((block_length, total_release_page_cnt));
+        }
+        self.reserve_stage_bytes(block_length as u64).await?;
+        let cache_index = match self
             .index
             .try_get_with(key, async {
                 let mut writer = self.local_storage.writer(&key.make_object_storage_path());
@@ -232,10 +288,24 @@ impl FileCache {
                 Ok(idx) as Result<CacheIndex>
             })
             .await
-            .map_err(|e| CacheError {
-                error: e.to_string(),
-            })?;
-        self.staged_index.write().await.insert(key, cache_index);
+        {
+            Ok(cache_index) => cache_index,
+            Err(error) => {
+                self.release_stage_bytes(block_length as u64);
+                return Err(CacheError {
+                    error: error.to_string(),
+                });
+            }
+        };
+        if self
+            .staged_index
+            .write()
+            .await
+            .insert(key, cache_index)
+            .is_some()
+        {
+            self.release_stage_bytes(block_length as u64);
+        }
 
         Ok((block_length, total_release_page_cnt))
     }
@@ -250,6 +320,7 @@ impl FileCache {
             self.local_storage.clone(),
             self.remote_storage.clone(),
             self.staged_index.clone(),
+            self.staged_bytes.clone(),
             &entry,
         )
         .await?;
@@ -278,6 +349,105 @@ impl FileCache {
         Ok(())
     }
 
+    pub async fn pending_count(&self) -> usize { self.staged_index.read().await.len() }
+
+    /// Best-effort shutdown snapshot that never waits on a cache worker lock.
+    pub fn try_pending_count(&self) -> Option<usize> {
+        self.staged_index.try_read().ok().map(|index| index.len())
+    }
+
+    async fn reserve_stage_bytes(&self, bytes: u64) -> Result<()> {
+        let mut current = self.staged_bytes.load(Ordering::Acquire);
+        loop {
+            let Some(next) = current.checked_add(bytes) else {
+                return ErrStageNoMoreSpaceSnafu {
+                    cache_dir: self.stage_dir.display().to_string(),
+                }
+                .fail();
+            };
+            if next > self.max_stage_size {
+                if bytes <= self.max_stage_size && current != 0 {
+                    self.schedule_pressure_migration().await;
+                }
+                return ErrStageNoMoreSpaceSnafu {
+                    cache_dir: self.stage_dir.display().to_string(),
+                }
+                .fail();
+            }
+            match self.staged_bytes.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    async fn schedule_pressure_migration(&self) {
+        if self
+            .pressure_migration_active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let entry = self.staged_index.read().await.values().next().cloned();
+        let Some(entry) = entry else {
+            self.pressure_migration_active
+                .store(false, Ordering::Release);
+            return;
+        };
+        let local_storage = self.local_storage.clone();
+        let remote_storage = self.remote_storage.clone();
+        let staged_index = self.staged_index.clone();
+        let staged_bytes = self.staged_bytes.clone();
+        let active = self.pressure_migration_active.clone();
+        let cancellation = self.tasks.cancellation_token();
+        if !self.tasks.spawn(async move {
+            let _active_guard = AtomicFlagGuard(active);
+            migrate_with_retry(
+                local_storage,
+                remote_storage,
+                staged_index,
+                staged_bytes,
+                entry,
+                cancellation,
+            )
+            .await;
+        }) {
+            self.pressure_migration_active
+                .store(false, Ordering::Release);
+        }
+    }
+
+    fn release_stage_bytes(&self, bytes: u64) {
+        self.staged_bytes.fetch_sub(bytes, Ordering::AcqRel);
+    }
+
+    async fn remove_staged(&self, key: &SliceKey) {
+        if let Some(entry) = self.staged_index.write().await.remove(key) {
+            self.release_stage_bytes(entry.slice_key.block_size as u64);
+        }
+    }
+
+    pub async fn flush_all(self: &Arc<Self>) -> Result<usize> {
+        let mut keys = self
+            .staged_index
+            .read()
+            .await
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        keys.sort_unstable_by_key(|key| (key.slice_id, key.block_idx));
+        for key in keys {
+            self.flush_key(&key).await?;
+        }
+        Ok(self.pending_count().await)
+    }
+
     async fn remote_block_is_confirmed(&self, slice_key: &SliceKey) -> Result<bool> {
         match self
             .remote_storage
@@ -289,6 +459,12 @@ impl FileCache {
             Err(error) => Err(error).context(ObjectStorageSnafu),
         }
     }
+}
+
+struct AtomicFlagGuard(Arc<AtomicBool>);
+
+impl Drop for AtomicFlagGuard {
+    fn drop(&mut self) { self.0.store(false, Ordering::Release) }
 }
 
 fn recover_stage_index(stage_dir: &Path) -> Result<HashMap<SliceKey, CacheIndex>> {
@@ -344,18 +520,25 @@ async fn migrate_with_retry(
     local_storage: LocalStorage,
     remote_storage: ObjectStorage,
     staged_index: Arc<tokio::sync::RwLock<HashMap<SliceKey, CacheIndex>>>,
+    staged_bytes: Arc<AtomicU64>,
     entry: CacheIndex,
+    cancellation: CancellationToken,
 ) {
     let mut retry_delay = Duration::from_millis(20);
     loop {
-        match migrate_once(
+        let migration = migrate_once(
             local_storage.clone(),
             remote_storage.clone(),
             staged_index.clone(),
+            staged_bytes.clone(),
             &entry,
-        )
-        .await
-        {
+        );
+        let result = tokio::select! {
+            biased;
+            () = cancellation.cancelled() => break,
+            result = migration => result,
+        };
+        match result {
             Ok(()) => break,
             Err(error) => {
                 error!(
@@ -364,7 +547,11 @@ async fn migrate_with_retry(
                     %error,
                     "failed to migrate staged block; retrying"
                 );
-                tokio::time::sleep(retry_delay).await;
+                tokio::select! {
+                    biased;
+                    () = cancellation.cancelled() => break,
+                    () = tokio::time::sleep(retry_delay) => {}
+                }
                 retry_delay = min(retry_delay * 2, Duration::from_secs(1));
             }
         }
@@ -375,6 +562,7 @@ async fn migrate_once(
     local_storage: LocalStorage,
     remote_storage: ObjectStorage,
     staged_index: Arc<tokio::sync::RwLock<HashMap<SliceKey, CacheIndex>>>,
+    staged_bytes: Arc<AtomicU64>,
     entry: &CacheIndex,
 ) -> Result<()> {
     let _migration_guard = entry.migration_lock.lock().await;
@@ -395,14 +583,19 @@ async fn migrate_once(
     )
     .await?;
 
-    {
+    let removed = {
         let mut staged_index = staged_index.write().await;
         if staged_index
             .get(&entry.slice_key)
             .is_some_and(|current| current.same_generation(entry))
         {
-            staged_index.remove(&entry.slice_key);
+            staged_index.remove(&entry.slice_key)
+        } else {
+            None
         }
+    };
+    if let Some(removed) = removed {
+        staged_bytes.fetch_sub(removed.slice_key.block_size as u64, Ordering::AcqRel);
     }
     Ok(())
 }
@@ -511,6 +704,10 @@ mod tests {
         }
     }
 
+    fn new_test_cache(config: Config, remote_storage: ObjectStorage) -> Result<FileCache> {
+        FileCache::new(config, remote_storage, Arc::new(MountTaskRegistry::new()))
+    }
+
     async fn stage_bytes(cache: &Arc<FileCache>, slice_key: SliceKey, content: &[u8]) {
         let memory_pool = pool::memory_pool::MemoryPagePool::new(PAGE_SIZE, PAGE_SIZE * 2).unwrap();
         let mut pages: Box<[Option<Page>]> = (0..(BLOCK_SIZE / PAGE_SIZE)).map(|_| None).collect();
@@ -545,7 +742,7 @@ mod tests {
         std::fs::remove_dir_all(&remote_dir).unwrap();
         std::fs::write(&remote_dir, b"block remote directory recreation").unwrap();
         let cache = Arc::new(
-            FileCache::new(
+            new_test_cache(
                 test_config(stage_dir, Duration::from_millis(10)),
                 remote_storage,
             )
@@ -605,7 +802,7 @@ mod tests {
             kiseki_utils::object_storage::new_local_object_store(&remote_dir).unwrap();
         let remote_probe = remote_storage.clone();
         let cache = Arc::new(
-            FileCache::new(
+            new_test_cache(
                 test_config(stage_dir, Duration::from_secs(3600)),
                 remote_storage,
             )
@@ -655,7 +852,7 @@ mod tests {
     async fn missing_local_stage_is_not_mistaken_for_remote_durability() {
         let tempdir = tempfile::tempdir().unwrap();
         let cache = Arc::new(
-            FileCache::new(
+            new_test_cache(
                 test_config(tempdir.path().join("stage"), Duration::from_secs(3600)),
                 kiseki_utils::object_storage::new_local_object_store(tempdir.path().join("remote"))
                     .unwrap(),
@@ -675,6 +872,48 @@ mod tests {
         assert!(cache.flush_key(&slice_key).await.is_err());
     }
 
+    #[tokio::test]
+    async fn full_stage_cache_rejects_new_blocks_without_losing_existing_data() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let remote_dir = tempdir.path().join("remote");
+        let remote_storage =
+            kiseki_utils::object_storage::new_local_object_store(&remote_dir).unwrap();
+        let cache = Arc::new(
+            new_test_cache(
+                Config {
+                    stage_cache_dir: tempdir.path().join("stage"),
+                    max_stage_size:  ReadableSize(PAGE_SIZE as u64),
+                    cache_ttl:       Duration::from_secs(3600),
+                },
+                remote_storage,
+            )
+            .unwrap(),
+        );
+        std::fs::remove_dir_all(&remote_dir).unwrap();
+        std::fs::write(&remote_dir, b"remote unavailable").unwrap();
+
+        let first = SliceKey::new(0xABCD_EF20, 0, PAGE_SIZE);
+        let second = SliceKey::new(0xABCD_EF21, 0, 1);
+        stage_bytes(&cache, first, &vec![0x5A; PAGE_SIZE]).await;
+        let memory_pool = pool::memory_pool::MemoryPagePool::new(PAGE_SIZE, PAGE_SIZE).unwrap();
+        let mut pages: Box<[Option<Page>]> = (0..(BLOCK_SIZE / PAGE_SIZE)).map(|_| None).collect();
+        pages[0] = Some(Page::Memory(memory_pool.acquire_page().await));
+
+        assert!(
+            cache
+                .stage(second.slice_id, second.block_idx, second.block_size, &pages)
+                .await
+                .is_err()
+        );
+        assert!(
+            cache
+                .get_range(&first, 0, PAGE_SIZE)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn restart_recovers_staged_block_index() {
         let tempdir = tempfile::tempdir().unwrap();
@@ -687,7 +926,7 @@ mod tests {
         let slice_key = SliceKey::new(0xABCD_EF02, 1, content.len());
 
         let cache = Arc::new(
-            FileCache::new(
+            new_test_cache(
                 test_config(stage_dir.clone(), Duration::from_secs(3600)),
                 remote_storage.clone(),
             )
@@ -699,7 +938,7 @@ mod tests {
         std::fs::write(&remote_dir, b"keep recovered data local first").unwrap();
 
         let recovered = Arc::new(
-            FileCache::new(
+            new_test_cache(
                 test_config(stage_dir, Duration::from_secs(3600)),
                 remote_storage,
             )
@@ -758,7 +997,7 @@ mod tests {
             std::fs::remove_dir_all(&remote_dir).unwrap();
             std::fs::write(&remote_dir, b"hold recovery in the local-readable state").unwrap();
             let cache = Arc::new(
-                FileCache::new(
+                new_test_cache(
                     test_config(stage_dir, Duration::from_secs(3600)),
                     remote_storage,
                 )
@@ -804,7 +1043,7 @@ mod tests {
         let stage_dir = PathBuf::from(std::env::var_os("KISEKI_STAGE_CRASH_DIR").unwrap());
         let remote_dir = PathBuf::from(std::env::var_os("KISEKI_STAGE_CRASH_REMOTE").unwrap());
         let cache = Arc::new(
-            FileCache::new(
+            new_test_cache(
                 test_config(stage_dir, Duration::from_secs(3600)),
                 kiseki_utils::object_storage::new_local_object_store(remote_dir).unwrap(),
             )
@@ -830,7 +1069,7 @@ mod tests {
         let temp_path = stage_dir.join(temp_name);
         std::fs::write(&temp_path, b"partial").unwrap();
 
-        let cache = FileCache::new(
+        let cache = new_test_cache(
             test_config(stage_dir, Duration::from_secs(3600)),
             kiseki_utils::object_storage::new_memory_object_store(),
         )
@@ -851,7 +1090,7 @@ mod tests {
             cache_ttl:       Duration::from_secs(1),
         };
         let remote_storage = kiseki_utils::object_storage::new_memory_object_store();
-        let cache = Arc::new(FileCache::new(config, remote_storage).unwrap());
+        let cache = Arc::new(new_test_cache(config, remote_storage).unwrap());
 
         let pool_size = 20 << 20; // 20M
         let memory_pool = pool::memory_pool::MemoryPagePool::new(PAGE_SIZE, pool_size).unwrap();
@@ -903,6 +1142,9 @@ mod tests {
 
         let cached = cache.index.get(&slice_key).await;
         assert!(cached.is_none());
+        cache.index.run_pending_tasks().await;
+        cache.tasks.begin_draining();
+        cache.tasks.wait().await;
 
         // the local storage should be empty after the cache expired.
         let bytes = cache

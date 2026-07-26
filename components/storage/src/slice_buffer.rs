@@ -17,6 +17,7 @@
 use std::{
     cmp::{max, min},
     io::Cursor,
+    sync::Arc,
 };
 
 use kiseki_common::{BLOCK_SIZE, BlockIndex, BlockSize, CHUNK_SIZE, PAGE_SIZE};
@@ -25,17 +26,17 @@ use kiseki_utils::{
     object_storage::{ObjectStorage, ObjectStoragePath},
     readable_size::ReadableSize,
 };
-use snafu::ResultExt;
+use snafu::{OptionExt, ResultExt};
 use tokio::{io::AsyncWriteExt, time::Instant};
 use tracing::{debug, instrument};
 
 use crate::{
     cache,
     err::{
-        InvalidRangeSnafu, InvalidSliceBufferWriteOffsetSnafu, ObjectStorageSnafu, Result,
-        UnexpectedLengthSnafu, UnknownIOSnafu,
+        InvalidRangeSnafu, InvalidSliceBufferWriteOffsetSnafu, ObjectStorageSnafu,
+        PagePoolExhaustedSnafu, Result, UnexpectedLengthSnafu, UnknownIOSnafu,
     },
-    pool::{GLOBAL_HYBRID_PAGE_POOL, Page},
+    pool::{HybridPagePool, Page},
 };
 
 // read_slice_from_object_storage will allocate memory in place and then drop
@@ -142,6 +143,7 @@ fn cal_object_block_size(length: usize, block_idx: BlockIndex, block_size: Block
 /// As long as the SliceBuffer is not frozen, we should be able to
 /// modify on it, for achieving better random write performance.
 pub struct SliceBuffer {
+    page_pool:      Arc<HybridPagePool>,
     /// the slice length, the total write len of the slice.
     /// we may write some block we just write before.
     length:         usize,
@@ -155,16 +157,13 @@ pub struct SliceBuffer {
     total_page_cnt: usize,
 }
 
-impl Default for SliceBuffer {
-    fn default() -> Self { Self::new() }
-}
-
 impl SliceBuffer {
-    pub fn new() -> Self {
+    pub fn new(page_pool: Arc<HybridPagePool>) -> Self {
         Self {
-            length:         0,
+            page_pool,
+            length: 0,
             flushed_length: 0,
-            block_slots:    (0..(CHUNK_SIZE / BLOCK_SIZE))
+            block_slots: (0..(CHUNK_SIZE / BLOCK_SIZE))
                 .map(|_| Block::Empty)
                 .collect(),
             total_page_cnt: 0,
@@ -284,6 +283,8 @@ impl SliceBuffer {
             self.flushed_length
         );
 
+        self.reserve_pages_for_write(offset, write_end)?;
+
         let mut total_write_len = 0;
         while total_write_len < expected_write_len {
             let new_offset = offset + total_write_len;
@@ -323,7 +324,7 @@ impl SliceBuffer {
                 let new_block_offset = block_offset + total_page_write_len;
                 let page_index = new_block_offset / PAGE_SIZE;
                 let page_offset = new_block_offset % PAGE_SIZE;
-                let (page, new_one) = data_block.get_page(page_index).await?;
+                let (page, new_one) = data_block.get_page(&self.page_pool, page_index).await?;
                 if new_one {
                     self.total_page_cnt += 1;
                 }
@@ -343,6 +344,45 @@ impl SliceBuffer {
         }
         self.length = max(self.length, write_end);
         Ok(total_write_len)
+    }
+
+    fn reserve_pages_for_write(&mut self, offset: usize, write_end: usize) -> Result<()> {
+        let pages_per_block = BLOCK_SIZE / PAGE_SIZE;
+        let first_page = offset / PAGE_SIZE;
+        let last_page = (write_end - 1) / PAGE_SIZE;
+        let mut missing = Vec::new();
+        for global_page in first_page..=last_page {
+            let block_index = global_page / pages_per_block;
+            let page_index = global_page % pages_per_block;
+            let needs_page = match &self.block_slots[block_index] {
+                Block::Empty => true,
+                Block::Data(block) => block.pages[page_index].is_none(),
+            };
+            if needs_page {
+                missing.push((block_index, page_index));
+            }
+        }
+
+        let mut reserved = Vec::with_capacity(missing.len());
+        for _ in 0..missing.len() {
+            reserved.push(
+                self.page_pool
+                    .try_acquire_page()
+                    .context(PagePoolExhaustedSnafu)?,
+            );
+        }
+        let reserved_count = reserved.len();
+        for ((block_index, page_index), page) in missing.into_iter().zip(reserved) {
+            if matches!(self.block_slots[block_index], Block::Empty) {
+                self.block_slots[block_index] = Block::new_data_block();
+            }
+            let Block::Data(block) = &mut self.block_slots[block_index] else {
+                unreachable!("empty block was initialized before reserving a page")
+            };
+            block.pages[page_index] = Some(page);
+        }
+        self.total_page_cnt += reserved_count;
+        Ok(())
     }
 
     fn full_block_cnt(&self) -> usize {
@@ -641,7 +681,11 @@ impl Block {
 }
 
 impl DataBlock {
-    async fn get_page(&mut self, page_idx: usize) -> Result<(&mut Page, bool)> {
+    async fn get_page(
+        &mut self,
+        page_pool: &Arc<HybridPagePool>,
+        page_idx: usize,
+    ) -> Result<(&mut Page, bool)> {
         let start = Instant::now();
         debug!("try to get a page from block.");
         let pages_len = self.pages.len();
@@ -656,7 +700,11 @@ impl DataBlock {
         };
         let new_one = slot.is_none();
         if new_one {
-            *slot = Some(GLOBAL_HYBRID_PAGE_POOL.acquire_page().await);
+            *slot = Some(
+                page_pool
+                    .try_acquire_page()
+                    .context(PagePoolExhaustedSnafu)?,
+            );
         }
         debug!(
             "get a page from block, new: {}, cost: {:?}",
@@ -687,10 +735,69 @@ mod tests {
     use tracing::info;
 
     use super::*;
+    use crate::pool;
+
+    async fn new_test_buffer() -> SliceBuffer {
+        let pool = Arc::new(
+            pool::PagePoolBuilder::default()
+                .with_page_size(PAGE_SIZE)
+                .with_memory_capacity(BLOCK_SIZE * 2)
+                .build()
+                .await
+                .unwrap(),
+        );
+        SliceBuffer::new(pool)
+    }
+
+    #[tokio::test]
+    async fn injected_page_pools_are_isolated() {
+        let first_pool = Arc::new(
+            pool::PagePoolBuilder::default()
+                .with_page_size(PAGE_SIZE)
+                .with_memory_capacity(PAGE_SIZE)
+                .build()
+                .await
+                .unwrap(),
+        );
+        let second_pool = Arc::new(
+            pool::PagePoolBuilder::default()
+                .with_page_size(PAGE_SIZE)
+                .with_memory_capacity(PAGE_SIZE * 2)
+                .build()
+                .await
+                .unwrap(),
+        );
+        let mut buffer = SliceBuffer::new(first_pool.clone());
+
+        buffer.write_at(0, b"x").await.unwrap();
+
+        assert_eq!(first_pool.remain(), 0);
+        assert_eq!(second_pool.remain(), 2);
+    }
+
+    #[tokio::test]
+    async fn exhausted_page_pool_fails_without_blocking_the_mount() {
+        let pool = Arc::new(
+            pool::PagePoolBuilder::default()
+                .with_page_size(PAGE_SIZE)
+                .with_memory_capacity(PAGE_SIZE)
+                .build()
+                .await
+                .unwrap(),
+        );
+        let mut buffer = SliceBuffer::new(pool);
+        buffer.write_at(0, &vec![1; PAGE_SIZE]).await.unwrap();
+
+        let result =
+            tokio::time::timeout(Duration::from_millis(50), buffer.write_at(PAGE_SIZE, b"x"))
+                .await
+                .expect("page pool exhaustion must not hang");
+        assert!(result.is_err());
+    }
 
     #[tokio::test]
     async fn basic_write() {
-        let mut slice_buffer = SliceBuffer::new();
+        let mut slice_buffer = new_test_buffer().await;
         let data = b"hello".as_slice();
 
         let write_len = slice_buffer.write_at(0, data).await.unwrap();
@@ -722,7 +829,7 @@ mod tests {
 
     #[tokio::test]
     async fn basic_read() {
-        let mut slice_buffer = SliceBuffer::new();
+        let mut slice_buffer = new_test_buffer().await;
         let data = b"hello".as_slice();
 
         let write_len = slice_buffer.write_at(0, data).await.unwrap();
@@ -754,7 +861,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_clamps_at_logical_eof() {
-        let mut slice_buffer = SliceBuffer::new();
+        let mut slice_buffer = new_test_buffer().await;
         slice_buffer.write_at(0, b"hello").await.unwrap();
         let mut dst = [0xA5; 8];
 
@@ -767,7 +874,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_writes_outside_the_chunk() {
-        let mut slice_buffer = SliceBuffer::new();
+        let mut slice_buffer = new_test_buffer().await;
 
         assert!(slice_buffer.write_at(CHUNK_SIZE, b"x").await.is_err());
         assert!(slice_buffer.write_at(usize::MAX, b"x").await.is_err());
@@ -785,6 +892,7 @@ mod tests {
                     cache_ttl:       Duration::from_secs(3600),
                 },
                 new_memory_object_store(),
+                Arc::new(crate::task_registry::MountTaskRegistry::new()),
             )
             .unwrap(),
         );
@@ -792,7 +900,7 @@ mod tests {
         std::fs::write(&stage_dir, b"prevent local stage writes").unwrap();
 
         let data = b"buffered bytes must survive a failed stage";
-        let mut slice_buffer = SliceBuffer::new();
+        let mut slice_buffer = new_test_buffer().await;
         slice_buffer.write_at(0, data).await.unwrap();
         let page_count = slice_buffer.total_page_cnt;
 
@@ -832,10 +940,11 @@ mod tests {
                     cache_ttl:       Duration::from_secs(3600),
                 },
                 new_memory_object_store(),
+                Arc::new(crate::task_registry::MountTaskRegistry::new()),
             )
             .unwrap(),
         );
-        let mut slice_buffer = SliceBuffer::new();
+        let mut slice_buffer = new_test_buffer().await;
         let write_offset = BLOCK_SIZE + 3;
         let data = b"sparse";
         slice_buffer.write_at(write_offset, data).await.unwrap();
@@ -855,7 +964,7 @@ mod tests {
         std::fs::write(&remote_dir, b"prevent remote writes").unwrap();
 
         let data = b"buffered bytes must survive a failed direct flush";
-        let mut slice_buffer = SliceBuffer::new();
+        let mut slice_buffer = new_test_buffer().await;
         slice_buffer.write_at(0, data).await.unwrap();
         let page_count = slice_buffer.total_page_cnt;
         let key_gen = |_: BlockIndex, _: BlockSize| "block".to_string();
@@ -898,7 +1007,7 @@ mod tests {
 
     #[tokio::test]
     async fn flushing_an_empty_buffer_is_a_noop() {
-        let mut slice_buffer = SliceBuffer::new();
+        let mut slice_buffer = new_test_buffer().await;
         let object_storage = new_memory_object_store();
         let key_gen = |_: BlockIndex, _: BlockSize| "unused".to_string();
 
@@ -913,7 +1022,7 @@ mod tests {
     async fn flush() {
         install_fmt_log();
 
-        let mut slice_buffer = SliceBuffer::new();
+        let mut slice_buffer = new_test_buffer().await;
         let data = b"hello".as_slice();
 
         let write_len = slice_buffer.write_at(0, data).await.unwrap();
@@ -1027,7 +1136,7 @@ mod tests {
 
         let object_sto = new_memory_object_store();
 
-        let mut slice_buffer = SliceBuffer::new();
+        let mut slice_buffer = new_test_buffer().await;
         let data = b"hello world".as_slice();
 
         let write_len = slice_buffer.write_at(0, data).await.unwrap();

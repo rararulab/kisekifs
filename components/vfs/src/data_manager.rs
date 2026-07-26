@@ -24,6 +24,8 @@ use kiseki_storage::{
         file_cache::{FileCache, FileCacheRef},
         mem_cache::{MemCache, MemCacheRef},
     },
+    pool::HybridPagePool,
+    task_registry::MountTaskRegistry,
 };
 use kiseki_types::ino::Ino;
 use kiseki_utils::object_storage::ObjectStorage;
@@ -50,6 +52,8 @@ pub(crate) struct DataManager {
     pub(crate) meta_engine:  MetaEngineRef,
     pub(crate) file_cache:   FileCacheRef,
     pub(crate) mem_cache:    MemCacheRef,
+    pub(crate) page_pool:    Arc<HybridPagePool>,
+    pub(crate) tasks:        Arc<MountTaskRegistry>,
 }
 
 impl DataManager {
@@ -58,12 +62,16 @@ impl DataManager {
         meta_engine_ref: MetaEngineRef,
         object_storage: ObjectStorage,
         file_cache_config: cache::file_cache::Config,
+        mem_cache_config: cache::mem_cache::Config,
+        page_pool: Arc<HybridPagePool>,
     ) -> Result<Self> {
-        let file_cache = Arc::new(FileCache::new(file_cache_config, object_storage.clone())?);
-        let mem_cache = Arc::new(MemCache::new(
-            cache::mem_cache::Config::default(),
-            object_storage,
-        ));
+        let tasks = Arc::new(MountTaskRegistry::new());
+        let file_cache = Arc::new(FileCache::new(
+            file_cache_config,
+            object_storage.clone(),
+            tasks.clone(),
+        )?);
+        let mem_cache = Arc::new(MemCache::new(mem_cache_config, object_storage));
 
         Ok(Self {
             chunk_size,
@@ -76,6 +84,8 @@ impl DataManager {
             meta_engine: meta_engine_ref,
             file_cache,
             mem_cache,
+            page_pool,
+            tasks,
         })
     }
 
@@ -100,4 +110,16 @@ impl DataManager {
         debug!("update_mtime do nothing, {ino}: {:?}", mtime);
         Ok(())
     }
+}
+
+#[cfg(test)]
+pub(crate) async fn new_test_page_pool() -> Arc<HybridPagePool> {
+    Arc::new(
+        kiseki_storage::pool::PagePoolBuilder::default()
+            .with_page_size(kiseki_common::PAGE_SIZE)
+            .with_memory_capacity(kiseki_common::BLOCK_SIZE * 4)
+            .build()
+            .await
+            .unwrap(),
+    )
 }

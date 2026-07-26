@@ -22,7 +22,6 @@ use kiseki_meta::context::FuseContext;
 use kiseki_types::ino::Ino;
 use libc::{EBADF, EFBIG, EINTR, EINVAL, ENOENT, ENOTSUP};
 use snafu::{OptionExt, ResultExt, ensure};
-use tokio::task::JoinHandle;
 use tracing::{debug, instrument};
 
 use super::{KisekiVFS, Opened};
@@ -530,15 +529,10 @@ impl KisekiVFS {
         Ok(())
     }
 
-    pub async fn release(
-        &self,
-        ctx: Arc<FuseContext>,
-        inode: Ino,
-        fh: FH,
-    ) -> Result<JoinHandle<()>> {
+    pub async fn release(&self, ctx: Arc<FuseContext>, inode: Ino, fh: FH) -> Result<()> {
         if inode.is_special() {
             self.handle_table.release_file_handle(inode, fh).await;
-            return Ok(tokio::spawn(async {}));
+            return Ok(());
         }
         if let Some(handle) = self.handle_table.find_handle(inode, fh).await {
             handle.wait_all_operations_done(ctx.clone()).await?;
@@ -569,10 +563,8 @@ impl KisekiVFS {
             }
         }
         self.meta.close(inode).await?;
-        let ht = self.handle_table.clone();
-        Ok(tokio::spawn(async move {
-            ht.release_file_handle(inode, fh).await;
-        }))
+        self.handle_table.release_file_handle(inode, fh).await;
+        Ok(())
     }
 }
 
