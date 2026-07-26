@@ -6,8 +6,6 @@ on:
   pull_request:
     branches: [ "main" ]
 
-
-
 defaults:
   run:
     shell: bash
@@ -16,18 +14,61 @@ permissions:
   contents: read
 
 jobs:
+  # Detect whether code (vs docs-/config-only) changed. The heavy Rust/Test jobs
+  # are gated on this inside the reusable workflows, so a docs-only PR skips them
+  # while the required aggregate checks (`Rust / Rust Success`, etc.) still report
+  # success — a *skipped* required check counts as passing, but a workflow that
+  # never triggers does not, which is why the filter lives here (and inside the
+  # reusable workflows) rather than in `on.*.paths`.
+  changes:
+    name: Detect changes
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Path filter
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            code:
+              - '**/*.rs'
+              - '**/Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain.toml'
+              - 'tests/**'
+              - 'benches/**'
+              - '.github/workflows/**'
+              - 'justfile'
+              - '.pre-commit-config.yaml'
+              - 'scripts/**'
+
   # Call individual workflow jobs
   lint:
     name: Lint
+    needs: changes
     uses: ./.github/workflows/lint.yml
+    with:
+      run_code: ${{ needs.changes.outputs.code }}
     secrets: inherit
 
   rust:
     name: Rust
+    needs: changes
     uses: ./.github/workflows/rust.yml
+    with:
+      run_code: ${{ needs.changes.outputs.code }}
     secrets: inherit
 
   test:
     name: Test
+    needs: changes
     uses: ./.github/workflows/test.yml
+    with:
+      run_code: ${{ needs.changes.outputs.code }}
     secrets: inherit
