@@ -900,8 +900,8 @@ fn mount(args: MountArgs) -> Result<(), Whatever> {
     });
     let unmount_error = should_unmount.then(|| unmounter.unmount().err()).flatten();
 
-    let session_error = join_session_until(session_guard, termination_deadline);
-    let detach_error = if should_unmount && session_error.is_some() {
+    let session_outcome = join_session_until(session_guard, termination_deadline);
+    let detach_error = if should_unmount && session_outcome.timed_out {
         detach_mount_after_timeout(&args.mount_point)
     } else {
         None
@@ -917,7 +917,7 @@ fn mount(args: MountArgs) -> Result<(), Whatever> {
     if let Some(error) = unmount_error {
         terminal_errors.push(format!("failed to unmount during shutdown: {error}"));
     }
-    if let Some(error) = session_error {
+    if let Some(error) = session_outcome.error {
         terminal_errors.push(error);
     }
     if let Some(error) = detach_error {
@@ -948,6 +948,11 @@ fn detach_mount_after_timeout(mount_point: &Path) -> Option<String> {
 #[cfg(not(target_os = "linux"))]
 fn detach_mount_after_timeout(_mount_point: &Path) -> Option<String> { None }
 
+struct SessionJoinOutcome {
+    error:     Option<String>,
+    timed_out: bool,
+}
+
 async fn wait_for_shutdown_request(requested: Arc<AtomicBool>) {
     while !requested.load(Ordering::Acquire) {
         tokio::time::sleep(Duration::from_millis(25)).await;
@@ -957,17 +962,24 @@ async fn wait_for_shutdown_request(requested: Arc<AtomicBool>) {
 fn join_session_until(
     session: thread::JoinHandle<std::io::Result<()>>,
     deadline: Instant,
-) -> Option<String> {
+) -> SessionJoinOutcome {
     while !session.is_finished() && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(10));
     }
     if !session.is_finished() {
-        return Some("FUSE session did not exit before the shutdown deadline".to_string());
+        return SessionJoinOutcome {
+            error:     Some("FUSE session did not exit before the shutdown deadline".to_string()),
+            timed_out: true,
+        };
     }
-    match session.join() {
+    let error = match session.join() {
         Ok(Ok(())) => None,
         Ok(Err(error)) => Some(format!("FUSE session failed: {error}")),
         Err(_) => Some("FUSE session thread panicked".to_string()),
+    };
+    SessionJoinOutcome {
+        error,
+        timed_out: false,
     }
 }
 
@@ -1020,6 +1032,41 @@ mod tests {
     struct TestCli {
         #[command(flatten)]
         mount: MountArgs,
+    }
+
+    #[test]
+    fn session_join_outcome_distinguishes_timeout_from_completed_failure() {
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let timed_out = join_session_until(
+            thread::spawn(move || {
+                release_rx.recv().unwrap();
+                Ok(())
+            }),
+            Instant::now(),
+        );
+        assert!(timed_out.timed_out);
+        assert!(timed_out.error.is_some());
+        release_tx.send(()).unwrap();
+
+        let failed = join_session_until(
+            thread::spawn(|| Err(std::io::Error::other("injected session failure"))),
+            Instant::now() + Duration::from_secs(1),
+        );
+        assert!(!failed.timed_out);
+        assert_eq!(
+            failed.error.as_deref(),
+            Some("FUSE session failed: injected session failure")
+        );
+
+        let panicked = join_session_until(
+            thread::spawn(|| -> std::io::Result<()> { panic!("injected session panic") }),
+            Instant::now() + Duration::from_secs(1),
+        );
+        assert!(!panicked.timed_out);
+        assert_eq!(
+            panicked.error.as_deref(),
+            Some("FUSE session thread panicked")
+        );
     }
 
     #[test]
