@@ -1868,6 +1868,7 @@ version = "0.1.0"
 name = "kiseki-fuse"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "fuse-backend-rs",
  "fuser",
  "kiseki-common",

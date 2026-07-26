@@ -39,6 +39,7 @@ use tokio::runtime;
 use tracing::{Instrument, debug, error, field, info, instrument};
 
 mod config;
+pub mod fbr;
 pub mod null;
 
 fn map_init_result<E: ToErrno>(result: std::result::Result<(), E>) -> Result<(), c_int> {

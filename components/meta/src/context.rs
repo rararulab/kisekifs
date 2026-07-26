@@ -43,6 +43,13 @@ impl<'a> From<&'a kiseki_types::Request<'a>> for FuseContext {
 }
 
 impl FuseContext {
+    /// Build a context from a caller identity without a FUSE request `unique`
+    /// (used by the fuse-backend-rs path, whose `Context` carries only
+    /// uid/gid/pid). The `unique` is set to 0.
+    pub fn from_uid_gid_pid(uid: u32, gid: u32, pid: u32) -> Self {
+        Self::from_identity(0, uid, gid, pid)
+    }
+
     fn from_identity(unique: u64, uid: u32, gid: u32, pid: u32) -> Self {
         Self {
             unique,
