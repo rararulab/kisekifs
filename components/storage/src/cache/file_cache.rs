@@ -53,7 +53,7 @@ use kiseki_utils::{
     readable_size::ReadableSize,
 };
 use snafu::{ResultExt, ensure};
-use tokio::io::{AsyncWrite, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio_util::{io::StreamReader, sync::CancellationToken};
 use tracing::{debug, error, warn};
 
@@ -106,6 +106,10 @@ pub struct FileCache {
     pressure_migration_active: Arc<AtomicBool>,
     max_stage_size:            u64,
     stage_dir:                 PathBuf,
+    /// io_uring offload for the hot stage-block write/read path. Blocks are
+    /// ordinary files, so the object-store backend above still reads/lists/
+    /// deletes the same paths for migration and recovery.
+    uring:                     crate::uring::UringPool,
 }
 
 impl FileCache {
@@ -210,7 +214,14 @@ impl FileCache {
             pressure_migration_active: Arc::new(AtomicBool::new(false)),
             max_stage_size: config.max_stage_size.as_bytes(),
             stage_dir: config.stage_cache_dir,
+            uring: crate::uring::UringPool::new(),
         })
+    }
+
+    /// Absolute filesystem path of a staged block (flat under `stage_dir`,
+    /// matching the object-store local backend's `{root}/{path}` layout).
+    fn stage_block_path(&self, slice_key: &SliceKey) -> PathBuf {
+        self.stage_dir.join(slice_key.gen_path_for_object_sto())
     }
 
     pub async fn get(self: &Arc<Self>, slice_key: &SliceKey) -> Result<Option<ObjectReader>> {
@@ -242,18 +253,11 @@ impl FileCache {
             warn!("block not found in the stage cache: {slice_key:?}");
             return Ok(None);
         }
-        let path = slice_key.make_object_storage_path();
-        debug!(
-            "find block in the stage cache: {:?}, try to use path: {:?} to load",
-            slice_key, &path
-        );
-        match self
-            .local_storage
-            .get_range(&path, offset..offset + length)
-            .await
-        {
+        let fs_path = self.stage_block_path(slice_key);
+        debug!("find block in the stage cache: {slice_key:?}, reading {fs_path:?} via io_uring");
+        match self.uring.read_range(fs_path, offset as u64, length).await {
             Ok(bytes) => Ok(Some(bytes)),
-            Err(error) if kiseki_utils::object_storage::is_not_found_error(&error) => {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 if self.remote_block_is_confirmed(slice_key).await? {
                     self.remove_staged(slice_key).await;
                     Ok(None)
@@ -261,7 +265,9 @@ impl FileCache {
                     FlushBlockFailedSnafu.fail()
                 }
             }
-            Err(error) => Err(error).context(ObjectStorageSnafu),
+            Err(error) => Err(CacheError {
+                error: error.to_string(),
+            }),
         }
     }
 
@@ -282,8 +288,13 @@ impl FileCache {
         let cache_index = match self
             .index
             .try_get_with(key, async {
-                let mut writer = self.local_storage.writer(&key.make_object_storage_path());
-                copy_from_buffer_to_local(block_length, pages, &mut writer).await?;
+                let bytes = gather_block(block_length, pages).await?;
+                self.uring
+                    .write(self.stage_block_path(&key), bytes)
+                    .await
+                    .map_err(|e| CacheError {
+                        error: e.to_string(),
+                    })?;
                 let idx = CacheIndex::new(key);
                 Ok(idx) as Result<CacheIndex>
             })
@@ -600,37 +611,24 @@ async fn migrate_once(
     Ok(())
 }
 
-async fn copy_from_buffer_to_local(
-    block_length: usize,
-    pages: &[Option<Page>],
-    writer: &mut Box<dyn AsyncWrite + Unpin + Send>,
-) -> Result<(usize, usize)> {
-    let mut total_released_page_cnt = 0;
-    let mut current_flush_length = 0;
-
-    while current_flush_length < block_length {
-        let page_idx = current_flush_length / PAGE_SIZE;
-        let page_offset = current_flush_length % PAGE_SIZE;
-        let to_flush_len = min(PAGE_SIZE - page_offset, block_length - current_flush_length);
+/// Assemble a staged block's bytes from its page buffers (missing pages read as
+/// zeros) into one contiguous buffer, ready for a single io_uring write.
+async fn gather_block(block_length: usize, pages: &[Option<Page>]) -> Result<Bytes> {
+    let mut buf: Vec<u8> = Vec::with_capacity(block_length);
+    let mut current = 0;
+    while current < block_length {
+        let page_idx = current / PAGE_SIZE;
+        let page_offset = current % PAGE_SIZE;
+        let to_copy = min(PAGE_SIZE - page_offset, block_length - current);
         match &pages[page_idx] {
-            None => {
-                let buf = vec![0u8; to_flush_len];
-                writer.write_all(&buf).await.context(UnknownIOSnafu)?;
-                // for _ in 0..to_flush_len {
-                //     writer.write_u8(0).await.context(UnknownIOSnafu)?;
-                // }
-            }
+            None => buf.resize(buf.len() + to_copy, 0),
             Some(page) => {
-                total_released_page_cnt += 1;
-                page.copy_to_writer(page_offset, to_flush_len, writer)
-                    .await?;
+                page.copy_to_writer(page_offset, to_copy, &mut buf).await?;
             }
         }
-        current_flush_length += to_flush_len;
+        current += to_copy;
     }
-    writer.flush().await.context(UnknownIOSnafu)?;
-    writer.shutdown().await.context(UnknownIOSnafu)?;
-    Ok((block_length, total_released_page_cnt))
+    Ok(Bytes::from(buf))
 }
 
 async fn migrate_from_local_to_remote(
