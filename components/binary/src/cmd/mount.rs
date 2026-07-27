@@ -777,10 +777,15 @@ fn mount(args: MountArgs) -> Result<(), Whatever> {
     let meta = kiseki_meta::open(meta_config)
         .with_whatever_context(|e| format!("failed to open meta, {e:?}"))?;
 
-    if args.fuse_backend != "fuser" {
+    // Env override wins over the flag (handy for A/B comparison during migration).
+    let fuse_backend =
+        std::env::var("KISEKI_FUSE_BACKEND").unwrap_or_else(|_| args.fuse_backend.clone());
+
+    if fuse_backend != "fuser" {
         // Default: fuse-backend-rs. The VFS keeps its own long-lived
         // multi-threaded runtime; the fusedev worker threads bridge into it via
-        // block_on.
+        // block_on. The mount lifecycle mirrors the fuser path below (graceful
+        // drain, readiness file, bounded shutdown).
         let threads = args.async_work_threads.max(1);
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(threads)
@@ -788,15 +793,37 @@ fn mount(args: MountArgs) -> Result<(), Whatever> {
             .enable_all()
             .build()
             .with_whatever_context(|error| format!("failed to build vfs runtime: {error}"))?;
-        let vfs = runtime
-            .block_on(KisekiVFS::new_checked(vfs_config, meta))
-            .with_whatever_context(|e| format!("failed to create file system, {e:?}"))?;
-        let vfs = std::sync::Arc::new(vfs);
+
+        // Startup polls the same shutdown latch and can be cancelled without
+        // publishing readiness.
+        let startup_signal = shutdown_requested.clone();
+        let file_system = match runtime.block_on(async {
+            tokio::select! {
+                result = KisekiVFS::new_checked(vfs_config, meta) => Some(result),
+                () = wait_for_shutdown_request(startup_signal) => None,
+            }
+        }) {
+            Some(result) => Arc::new(
+                result.with_whatever_context(|e| format!("failed to create file system, {e:?}"))?,
+            ),
+            None => return Ok(()),
+        };
+
+        if shutdown_requested.load(Ordering::Acquire) {
+            runtime
+                .block_on(file_system.shutdown(file_system.config.shutdown_deadline))
+                .with_whatever_context(|error| {
+                    format!("mount startup cancellation failed to drain cleanly: {error}")
+                })?;
+            return Ok(());
+        }
+
         runtime
-            .block_on(vfs.init(&kiseki_meta::context::FuseContext::background()))
+            .block_on(file_system.init(&kiseki_meta::context::FuseContext::background()))
             .with_whatever_context(|e| format!("failed to initialize file system, {e:?}"))?;
-        kiseki_fuse::fbr::mount_and_serve(
-            vfs,
+
+        let mut session = kiseki_fuse::fbr::mount(
+            file_system.clone(),
             runtime.handle().clone(),
             &args.mount_point,
             KISEKI,
@@ -805,9 +832,133 @@ fn mount(args: MountArgs) -> Result<(), Whatever> {
             threads,
         )
         .with_whatever_context(|e| {
-            format!("failed to mount kiseki on {}; {e}", args.mount_point.display())
+            format!(
+                "failed to mount kiseki on {}; {e}",
+                args.mount_point.display()
+            )
         })?;
-        drop(runtime);
+
+        let startup_deadline = Instant::now() + MOUNT_READY_TIMEOUT;
+        let mut received_signal = false;
+        let mut startup_error = None;
+        loop {
+            if file_system.lifecycle_state() == LifecycleState::Ready
+                && std::fs::metadata(&args.mount_point).is_ok()
+            {
+                break;
+            }
+            if file_system.lifecycle_state() == LifecycleState::Failed {
+                startup_error =
+                    Some("filesystem initialization failed before readiness".to_string());
+                break;
+            }
+            if session.all_finished() {
+                startup_error = Some("FUSE session exited before readiness".to_string());
+                break;
+            }
+            if shutdown_requested.load(Ordering::Acquire) {
+                received_signal = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(25));
+            if Instant::now() >= startup_deadline {
+                startup_error = Some("timed out waiting for truthful mount readiness".to_string());
+                break;
+            }
+        }
+
+        let ready_file = if !received_signal && startup_error.is_none() {
+            match ready_file_path {
+                Some(path) => {
+                    match ReadyFileGuard::create(path, &args.mount_point, file_system.volume_name())
+                    {
+                        Ok(guard) => Some(guard),
+                        Err(error) => {
+                            startup_error = Some(error.to_string());
+                            None
+                        }
+                    }
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+
+        if !received_signal && startup_error.is_none() {
+            loop {
+                if session.all_finished() {
+                    break;
+                }
+                if shutdown_requested.load(Ordering::Acquire) {
+                    received_signal = true;
+                    break;
+                }
+                thread::sleep(Duration::from_millis(25));
+            }
+        }
+
+        let termination_deadline = Instant::now() + file_system.config.shutdown_deadline;
+        drop(ready_file);
+        let should_unmount = received_signal || startup_error.is_some();
+        let shutdown_result =
+            runtime.block_on(file_system.shutdown(file_system.config.shutdown_deadline));
+        let unmount_error = if should_unmount {
+            session.stop().err().map(|error| error.to_string())
+        } else {
+            None
+        };
+
+        // Bound the worker drain by the same deadline.
+        while !session.all_finished() && Instant::now() < termination_deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        // A shutdown is clean only when the VFS drained without error, the
+        // workers finished, and the whole teardown fit inside the deadline. A
+        // tiny deadline (the forced-timeout case) fails the wall-clock check
+        // deterministically — this mirrors the fuser session-join timeout and
+        // does not depend on racing the background flusher.
+        let drained_cleanly = shutdown_result.is_ok()
+            && session.all_finished()
+            && Instant::now() < termination_deadline;
+        let detach_error = if should_unmount && !drained_cleanly {
+            detach_mount_after_timeout(&args.mount_point)
+        } else {
+            None
+        };
+
+        let mut terminal_errors = Vec::new();
+        if let Some(error) = startup_error {
+            terminal_errors.push(format!("mount startup failed: {error}"));
+        }
+        if let Err(error) = &shutdown_result {
+            terminal_errors.push(format!("mount shutdown failed: {error}"));
+        } else if should_unmount && !drained_cleanly {
+            terminal_errors.push("mount did not drain within the shutdown deadline".to_string());
+        }
+        if let Some(error) = unmount_error {
+            terminal_errors.push(format!("failed to unmount during shutdown: {error}"));
+        }
+        if let Some(error) = detach_error {
+            terminal_errors.push(error);
+        }
+
+        if drained_cleanly {
+            session.join();
+            drop(runtime);
+        } else {
+            // The mount was force-detached and the fusedev workers may still be
+            // parked in `block_on`; don't block process teardown on draining the
+            // runtime — the OS reclaims it as the process exits.
+            std::mem::forget(runtime);
+        }
+
+        if !terminal_errors.is_empty() {
+            whatever!(
+                "mount terminated with errors: {}",
+                terminal_errors.join("; ")
+            );
+        }
         return Ok(());
     }
 

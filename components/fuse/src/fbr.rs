@@ -21,17 +21,21 @@
 //! pool of worker threads each looping on `FuseChannel::get_request` +
 //! `Server::handle_message`. That path dispatches to the *synchronous*
 //! `FileSystem` trait. The KisekiFS VFS is async and keeps its own
-//! multi-threaded Tokio runtime, so each `FileSystem` method bridges via
-//! [`Handle::block_on`]. This does not hit the "block_on inside an async
-//! runtime" panic: the fusedev worker threads are plain OS threads with no
-//! runtime entered, and with `N` workers there are `N` concurrent in-flight
-//! requests — the same model nydus / virtiofsd ship.
+//! multi-threaded Tokio runtime, so each op bridges via [`Handle::block_on`].
+//! The fusedev workers are plain OS threads with no runtime entered, so
+//! `block_on` does not panic, and N workers give N concurrent in-flight
+//! requests — the model nydus / virtiofsd ship.
+//!
+//! Every op takes a VFS [`OperationGuard`] first (via
+//! [`KisekiVFS::begin_operation`]), so graceful shutdown drains in-flight ops
+//! and rejects new ones with `EIO` — matching the fuser layer's
+//! `begin_operation!` gate.
 //!
 //! (fuse-backend-rs 0.14's async fusedev task `FuseDevTask` is gated behind a
 //! non-existent `async_io` feature and is dead code, so the async server has no
 //! usable driver; the sync worker-pool path above is the production one.)
 
-use std::{ffi::CStr, io, path::Path, sync::Arc, time::Duration};
+use std::{ffi::CStr, future::Future, io, path::Path, sync::Arc, time::Duration};
 
 use fuse_backend_rs::{
     abi::fuse_abi::{CreateIn, stat64, statvfs64},
@@ -53,7 +57,7 @@ use kiseki_types::{
     entry::{Entry as KisekiEntry, FullEntry},
     ino::Ino,
 };
-use kiseki_vfs::KisekiVFS;
+use kiseki_vfs::{KisekiVFS, OperationGuard};
 use tokio::runtime::Handle;
 use tracing::{error, info};
 
@@ -160,6 +164,24 @@ impl KisekiFsBackend {
         ))
     }
 
+    /// Take an operation guard so shutdown can drain / reject in flight.
+    fn guard(&self) -> io::Result<OperationGuard> {
+        self.vfs
+            .begin_operation()
+            .ok_or_else(|| errno_io(libc::EIO))
+    }
+
+    /// Guard the op, run the VFS future to completion on the VFS runtime, and
+    /// map the VFS error to an `io::Error` with its errno preserved.
+    fn block<F, T, E>(&self, fut: F) -> io::Result<T>
+    where
+        F: Future<Output = std::result::Result<T, E>>,
+        E: ToErrno,
+    {
+        let _guard = self.guard()?;
+        self.vfs_rt.block_on(fut).map_err(to_io)
+    }
+
     fn build_entry(&self, e: &FullEntry) -> Entry {
         let ino: u64 = e.inode.into();
         let ttl = *self.vfs.get_entry_ttl(e.attr.kind);
@@ -187,10 +209,7 @@ impl FileSystem for KisekiFsBackend {
     fn lookup(&self, ctx: &Context, parent: Self::Inode, name: &CStr) -> io::Result<Entry> {
         let name = Self::cstr(name)?;
         let ctx = self.ctx(ctx);
-        let fe = self
-            .vfs_rt
-            .block_on(self.vfs.lookup(ctx, Ino::from(parent), name))
-            .map_err(to_io)?;
+        let fe = self.block(self.vfs.lookup(ctx, Ino::from(parent), name))?;
         Ok(self.build_entry(&fe))
     }
 
@@ -200,10 +219,7 @@ impl FileSystem for KisekiFsBackend {
         inode: Self::Inode,
         _handle: Option<Self::Handle>,
     ) -> io::Result<(stat64, Duration)> {
-        let attr = self
-            .vfs_rt
-            .block_on(self.vfs.get_attr(Ino::from(inode)))
-            .map_err(to_io)?;
+        let attr = self.block(self.vfs.get_attr(Ino::from(inode)))?;
         let ttl = *self.vfs.get_entry_ttl(attr.kind);
         Ok((attr_to_stat64(&attr, inode), ttl))
     }
@@ -263,32 +279,26 @@ impl FileSystem for KisekiFsBackend {
         };
 
         let ctx = self.ctx(ctx);
-        let new = self
-            .vfs_rt
-            .block_on(self.vfs.set_attr(
-                ctx,
-                Ino::from(inode),
-                flags.bits(),
-                atime,
-                mtime,
-                mode,
-                uid,
-                gid,
-                size,
-                fh,
-                None,
-            ))
-            .map_err(to_io)?;
+        let new = self.block(self.vfs.set_attr(
+            ctx,
+            Ino::from(inode),
+            flags.bits(),
+            atime,
+            mtime,
+            mode,
+            uid,
+            gid,
+            size,
+            fh,
+            None,
+        ))?;
         let ttl = *self.vfs.get_entry_ttl(new.kind);
         Ok((attr_to_stat64(&new, inode), ttl))
     }
 
     fn readlink(&self, ctx: &Context, inode: Self::Inode) -> io::Result<Vec<u8>> {
         let ctx = self.ctx(ctx);
-        let target = self
-            .vfs_rt
-            .block_on(self.vfs.readlink(ctx, Ino::from(inode)))
-            .map_err(to_io)?;
+        let target = self.block(self.vfs.readlink(ctx, Ino::from(inode)))?;
         Ok(target.to_vec())
     }
 
@@ -302,13 +312,10 @@ impl FileSystem for KisekiFsBackend {
         let target = Self::cstr(linkname)?;
         let name = Self::cstr(name)?;
         let ctx = self.ctx(ctx);
-        let fe = self
-            .vfs_rt
-            .block_on(
-                self.vfs
-                    .symlink(ctx, Ino::from(parent), name, Path::new(target)),
-            )
-            .map_err(to_io)?;
+        let fe = self.block(
+            self.vfs
+                .symlink(ctx, Ino::from(parent), name, Path::new(target)),
+        )?;
         Ok(self.build_entry(&fe))
     }
 
@@ -323,13 +330,10 @@ impl FileSystem for KisekiFsBackend {
     ) -> io::Result<Entry> {
         let name = Self::cstr(name)?.to_owned();
         let ctx = self.ctx(ctx);
-        let fe = self
-            .vfs_rt
-            .block_on(
-                self.vfs
-                    .mknod(ctx, Ino::from(parent), name, mode, umask, rdev),
-            )
-            .map_err(to_io)?;
+        let fe = self.block(
+            self.vfs
+                .mknod(ctx, Ino::from(parent), name, mode, umask, rdev),
+        )?;
         Ok(self.build_entry(&fe))
     }
 
@@ -343,27 +347,20 @@ impl FileSystem for KisekiFsBackend {
     ) -> io::Result<Entry> {
         let name = Self::cstr(name)?;
         let ctx = self.ctx(ctx);
-        let fe = self
-            .vfs_rt
-            .block_on(self.vfs.mkdir(ctx, Ino::from(parent), name, mode, umask))
-            .map_err(to_io)?;
+        let fe = self.block(self.vfs.mkdir(ctx, Ino::from(parent), name, mode, umask))?;
         Ok(self.build_entry(&fe))
     }
 
     fn unlink(&self, ctx: &Context, parent: Self::Inode, name: &CStr) -> io::Result<()> {
         let name = Self::cstr(name)?;
         let ctx = self.ctx(ctx);
-        self.vfs_rt
-            .block_on(self.vfs.unlink(ctx, Ino::from(parent), name))
-            .map_err(to_io)
+        self.block(self.vfs.unlink(ctx, Ino::from(parent), name))
     }
 
     fn rmdir(&self, ctx: &Context, parent: Self::Inode, name: &CStr) -> io::Result<()> {
         let name = Self::cstr(name)?;
         let ctx = self.ctx(ctx);
-        self.vfs_rt
-            .block_on(self.vfs.rmdir(ctx, Ino::from(parent), name))
-            .map_err(to_io)
+        self.block(self.vfs.rmdir(ctx, Ino::from(parent), name))
     }
 
     fn rename(
@@ -378,16 +375,14 @@ impl FileSystem for KisekiFsBackend {
         let oldname = Self::cstr(oldname)?;
         let newname = Self::cstr(newname)?;
         let ctx = self.ctx(ctx);
-        self.vfs_rt
-            .block_on(self.vfs.rename(
-                ctx,
-                Ino::from(olddir),
-                oldname,
-                Ino::from(newdir),
-                newname,
-                flags,
-            ))
-            .map_err(to_io)
+        self.block(self.vfs.rename(
+            ctx,
+            Ino::from(olddir),
+            oldname,
+            Ino::from(newdir),
+            newname,
+            flags,
+        ))
     }
 
     fn link(
@@ -399,13 +394,10 @@ impl FileSystem for KisekiFsBackend {
     ) -> io::Result<Entry> {
         let newname = Self::cstr(newname)?;
         let ctx = self.ctx(ctx);
-        let fe = self
-            .vfs_rt
-            .block_on(
-                self.vfs
-                    .link(ctx, Ino::from(inode), Ino::from(newparent), newname),
-            )
-            .map_err(to_io)?;
+        let fe = self.block(
+            self.vfs
+                .link(ctx, Ino::from(inode), Ino::from(newparent), newname),
+        )?;
         Ok(self.build_entry(&fe))
     }
 
@@ -417,10 +409,7 @@ impl FileSystem for KisekiFsBackend {
         _fuse_flags: u32,
     ) -> io::Result<(Option<Self::Handle>, OpenOptions, Option<u32>)> {
         let cctx = FuseContext::from_uid_gid_pid(ctx.uid, ctx.gid, ctx.pid as u32);
-        let opened = self
-            .vfs_rt
-            .block_on(self.vfs.open(&cctx, Ino::from(inode), flags as i32))
-            .map_err(to_io)?;
+        let opened = self.block(self.vfs.open(&cctx, Ino::from(inode), flags as i32))?;
         Ok((Some(opened.fh), OpenOptions::empty(), None))
     }
 
@@ -433,17 +422,14 @@ impl FileSystem for KisekiFsBackend {
     ) -> io::Result<(Entry, Option<Self::Handle>, OpenOptions, Option<u32>)> {
         let name = Self::cstr(name)?;
         let ctx = self.ctx(ctx);
-        let (fe, fh) = self
-            .vfs_rt
-            .block_on(self.vfs.create(
-                ctx,
-                Ino::from(parent),
-                name,
-                args.mode,
-                args.umask,
-                args.flags as i32,
-            ))
-            .map_err(to_io)?;
+        let (fe, fh) = self.block(self.vfs.create(
+            ctx,
+            Ino::from(parent),
+            name,
+            args.mode,
+            args.umask,
+            args.flags as i32,
+        ))?;
         Ok((self.build_entry(&fe), Some(fh), OpenOptions::empty(), None))
     }
 
@@ -460,18 +446,15 @@ impl FileSystem for KisekiFsBackend {
         flags: u32,
     ) -> io::Result<usize> {
         let ctx = self.ctx(ctx);
-        let data = self
-            .vfs_rt
-            .block_on(self.vfs.read(
-                ctx,
-                Ino::from(inode),
-                handle,
-                offset as i64,
-                size,
-                flags as i32,
-                lock_owner,
-            ))
-            .map_err(to_io)?;
+        let data = self.block(self.vfs.read(
+            ctx,
+            Ino::from(inode),
+            handle,
+            offset as i64,
+            size,
+            flags as i32,
+            lock_owner,
+        ))?;
         w.write_all(&data)?;
         Ok(data.len())
     }
@@ -493,19 +476,16 @@ impl FileSystem for KisekiFsBackend {
         let mut buf = vec![0u8; size as usize];
         r.read_exact(&mut buf)?;
         let ctx = self.ctx(ctx);
-        let written = self
-            .vfs_rt
-            .block_on(self.vfs.write(
-                ctx,
-                Ino::from(inode),
-                handle,
-                offset as i64,
-                &buf,
-                0,
-                flags as i32,
-                lock_owner,
-            ))
-            .map_err(to_io)?;
+        let written = self.block(self.vfs.write(
+            ctx,
+            Ino::from(inode),
+            handle,
+            offset as i64,
+            &buf,
+            0,
+            flags as i32,
+            lock_owner,
+        ))?;
         Ok(written as usize)
     }
 
@@ -517,9 +497,7 @@ impl FileSystem for KisekiFsBackend {
         lock_owner: u64,
     ) -> io::Result<()> {
         let ctx = self.ctx(ctx);
-        self.vfs_rt
-            .block_on(self.vfs.flush(ctx, Ino::from(inode), handle, lock_owner))
-            .map_err(to_io)
+        self.block(self.vfs.flush(ctx, Ino::from(inode), handle, lock_owner))
     }
 
     fn fsync(
@@ -530,9 +508,7 @@ impl FileSystem for KisekiFsBackend {
         handle: Self::Handle,
     ) -> io::Result<()> {
         let ctx = self.ctx(ctx);
-        self.vfs_rt
-            .block_on(self.vfs.fsync(ctx, Ino::from(inode), handle, datasync))
-            .map_err(to_io)
+        self.block(self.vfs.fsync(ctx, Ino::from(inode), handle, datasync))
     }
 
     fn fallocate(
@@ -545,16 +521,14 @@ impl FileSystem for KisekiFsBackend {
         length: u64,
     ) -> io::Result<()> {
         let ctx = self.ctx(ctx);
-        self.vfs_rt
-            .block_on(self.vfs.fallocate(
-                ctx,
-                Ino::from(inode),
-                handle,
-                offset as i64,
-                length as i64,
-                mode as i32,
-            ))
-            .map_err(to_io)
+        self.block(self.vfs.fallocate(
+            ctx,
+            Ino::from(inode),
+            handle,
+            offset as i64,
+            length as i64,
+            mode as i32,
+        ))
     }
 
     fn release(
@@ -570,10 +544,8 @@ impl FileSystem for KisekiFsBackend {
         let ctx = self.ctx(ctx);
         // The returned JoinHandle drives background finalisation; not awaited
         // here (matches the fuser layer).
-        self.vfs_rt
-            .block_on(self.vfs.release(ctx, Ino::from(inode), handle))
+        self.block(self.vfs.release(ctx, Ino::from(inode), handle))
             .map(|_| ())
-            .map_err(to_io)
     }
 
     fn opendir(
@@ -583,10 +555,7 @@ impl FileSystem for KisekiFsBackend {
         flags: u32,
     ) -> io::Result<(Option<Self::Handle>, OpenOptions)> {
         let cctx = FuseContext::from_uid_gid_pid(ctx.uid, ctx.gid, ctx.pid as u32);
-        let fh = self
-            .vfs_rt
-            .block_on(self.vfs.open_dir(&cctx, Ino::from(inode), flags as i32))
-            .map_err(to_io)?;
+        let fh = self.block(self.vfs.open_dir(&cctx, Ino::from(inode), flags as i32))?;
         Ok((Some(fh), OpenOptions::empty()))
     }
 
@@ -600,13 +569,11 @@ impl FileSystem for KisekiFsBackend {
         add_entry: &mut dyn FnMut(DirEntry) -> io::Result<usize>,
     ) -> io::Result<()> {
         let cctx = FuseContext::from_uid_gid_pid(ctx.uid, ctx.gid, ctx.pid as u32);
-        let entries = self
-            .vfs_rt
-            .block_on(
+        let entries =
+            self.block(
                 self.vfs
                     .read_dir(&cctx, Ino::from(inode), handle, offset as i64, false),
-            )
-            .map_err(to_io)?;
+            )?;
         for (next, e) in (offset + 1..).zip(entries.iter()) {
             let de = DirEntry {
                 ino:    e.get_inode().0,
@@ -631,13 +598,11 @@ impl FileSystem for KisekiFsBackend {
         add_entry: &mut dyn FnMut(DirEntry, Entry) -> io::Result<usize>,
     ) -> io::Result<()> {
         let cctx = FuseContext::from_uid_gid_pid(ctx.uid, ctx.gid, ctx.pid as u32);
-        let entries = self
-            .vfs_rt
-            .block_on(
+        let entries =
+            self.block(
                 self.vfs
                     .read_dir(&cctx, Ino::from(inode), handle, offset as i64, true),
-            )
-            .map_err(to_io)?;
+            )?;
         for (next, e) in (offset + 1..).zip(entries.iter()) {
             let KisekiEntry::Full(fe) = e else { continue };
             let de = DirEntry {
@@ -660,12 +625,11 @@ impl FileSystem for KisekiFsBackend {
         _flags: u32,
         handle: Self::Handle,
     ) -> io::Result<()> {
-        self.vfs_rt
-            .block_on(self.vfs.release_dir(Ino::from(inode), handle))
-            .map_err(to_io)
+        self.block(self.vfs.release_dir(Ino::from(inode), handle))
     }
 
     fn statfs(&self, ctx: &Context, inode: Self::Inode) -> io::Result<statvfs64> {
+        let _guard = self.guard()?;
         let ctx = self.ctx(ctx);
         let state = self.vfs.stat_fs(ctx, Ino::from(inode)).map_err(to_io)?;
 
@@ -688,16 +652,46 @@ impl FileSystem for KisekiFsBackend {
 }
 
 // ---------------------------------------------------------------------------
-// mount + serve
+// mount session handle
 // ---------------------------------------------------------------------------
 
-/// Mount KisekiFS at `mountpoint` via fuse-backend-rs and serve requests on
-/// `num_threads` worker threads until the filesystem is unmounted. Blocks the
-/// calling thread until then.
-///
-/// `vfs_rt` must be a live multi-threaded Tokio runtime handle owning the VFS'
-/// background tasks; it has to outlive this call.
-pub fn mount_and_serve(
+/// A mounted fuse-backend-rs session and its worker-thread pool. The caller
+/// orchestrates the mount lifecycle (readiness, shutdown) around it.
+pub struct FbrSession {
+    session: FuseSession,
+    workers: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl FbrSession {
+    /// Have all worker threads finished (i.e. the mount is torn down)?
+    pub fn all_finished(&self) -> bool {
+        self.workers
+            .iter()
+            .all(std::thread::JoinHandle::is_finished)
+    }
+
+    /// Signal the workers to stop and tear down the kernel mount. Waking the
+    /// channels makes `get_request` return `None`; `umount` removes the mount
+    /// so `is_mounted` becomes false.
+    pub fn stop(&mut self) -> io::Result<()> {
+        let _ = self.session.wake();
+        self.session
+            .umount()
+            .map_err(|e| io::Error::other(format!("umount fuse session: {e}")))
+    }
+
+    /// Join all worker threads (blocks).
+    pub fn join(self) {
+        for w in self.workers {
+            let _ = w.join();
+        }
+    }
+}
+
+/// Mount KisekiFS at `mountpoint` via fuse-backend-rs and spawn `num_threads`
+/// worker threads. Returns once the kernel mount is live; the caller drives the
+/// lifecycle via the returned [`FbrSession`].
+pub fn mount(
     vfs: Arc<KisekiVFS>,
     vfs_rt: Handle,
     mountpoint: &Path,
@@ -705,7 +699,7 @@ pub fn mount_and_serve(
     allow_other: bool,
     read_only: bool,
     num_threads: usize,
-) -> io::Result<()> {
+) -> io::Result<FbrSession> {
     let backend = KisekiFsBackend::new(vfs, vfs_rt);
     let server = Arc::new(Server::new(backend));
 
@@ -717,7 +711,7 @@ pub fn mount_and_serve(
         .map_err(|e| io::Error::other(format!("mount fuse session: {e}")))?;
     info!("kiseki (fuse-backend-rs) mounted at {mountpoint:?} with {num_threads} worker(s)");
 
-    let threads = (0..num_threads.max(1))
+    let workers = (0..num_threads.max(1))
         .map(|i| {
             let channel = session
                 .new_channel()
@@ -729,11 +723,7 @@ pub fn mount_and_serve(
         })
         .collect::<io::Result<Vec<_>>>()?;
 
-    for t in threads {
-        let _ = t.join();
-    }
-    let _ = session.umount();
-    Ok(())
+    Ok(FbrSession { session, workers })
 }
 
 /// Per-worker request loop.
