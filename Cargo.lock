@@ -1830,6 +1830,7 @@ dependencies = [
  "humantime",
  "kiseki-common",
  "kiseki-fuse",
+ "kiseki-fuse-backend",
  "kiseki-meta",
  "kiseki-storage",
  "kiseki-types",
@@ -1854,7 +1855,6 @@ version = "0.1.0"
 name = "kiseki-fuse"
 version = "0.1.0"
 dependencies = [
- "fuse-backend-rs",
  "fuser",
  "kiseki-common",
  "kiseki-meta",
@@ -1864,6 +1864,21 @@ dependencies = [
  "kiseki-vfs",
  "libc",
  "snafu",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "kiseki-fuse-backend"
+version = "0.1.0"
+dependencies = [
+ "fuse-backend-rs",
+ "fuser",
+ "kiseki-common",
+ "kiseki-meta",
+ "kiseki-types",
+ "kiseki-vfs",
+ "libc",
  "tokio",
  "tracing",
 ]

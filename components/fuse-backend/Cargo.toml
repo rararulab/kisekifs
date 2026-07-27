@@ -1,0 +1,25 @@
+[package]
+name = "kiseki-fuse-backend"
+version.workspace = true
+edition.workspace = true
+
+# The fuse-backend-rs FUSE frontend (issue #71). Kept as its own crate so its
+# transport dependencies (caps, vmm-sys-util, io_uring, ...) stay isolated from
+# the legacy `kiseki-fuse` (fuser) crate, and so removing fuser later is just a
+# crate deletion.
+
+[dependencies]
+fuse-backend-rs = { workspace = true, features = ["fusedev"] }
+# Only for `TimeOrNow`, which the VFS `set_attr` API still speaks.
+fuser.workspace = true
+libc.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+kiseki-common = { path = "../../components/common" }
+kiseki-meta = { path = "../../components/meta" }
+kiseki-types = { path = "../../components/types" }
+kiseki-vfs = { path = "../../components/vfs" }
+
+[lints]
+workspace = true

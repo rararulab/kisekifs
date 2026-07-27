@@ -822,7 +822,7 @@ fn mount(args: MountArgs) -> Result<(), Whatever> {
             .block_on(file_system.init(&kiseki_meta::context::FuseContext::background()))
             .with_whatever_context(|e| format!("failed to initialize file system, {e:?}"))?;
 
-        let mut session = kiseki_fuse::fbr::mount(
+        let mut session = kiseki_fuse_backend::mount(
             file_system.clone(),
             runtime.handle().clone(),
             &args.mount_point,

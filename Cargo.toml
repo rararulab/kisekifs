@@ -17,6 +17,7 @@ members = [
     "components/meta",
     "components/common",
     "components/fuse",
+    "components/fuse-backend",
     "components/binary",
 ]
 [workspace.dependencies]
