@@ -16,6 +16,7 @@
 
 pub mod err;
 pub mod pool;
+pub mod uring;
 
 pub mod slice_buffer;
 pub mod task_registry;
