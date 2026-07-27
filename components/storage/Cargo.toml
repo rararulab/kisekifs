@@ -12,6 +12,7 @@ crossbeam-queue.workspace = true
 futures.workspace = true
 snafu.workspace = true
 tokio.workspace = true
+tokio-uring.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
 

@@ -19,6 +19,7 @@ tracing.workspace = true
 #kiseki-utils = {path = "../../components/utils", features = ["tokio-console"]}
 kiseki-common = { path = "../../components/common" }
 kiseki-fuse = { path = "../../components/fuse" }
+kiseki-fuse-backend = { path = "../../components/fuse-backend" }
 kiseki-meta = { path = "../../components/meta", features = ["meta-rocksdb"] }
 kiseki-storage = { path = "../../components/storage" }
 kiseki-types = { path = "../../components/types" }
