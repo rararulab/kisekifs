@@ -9,6 +9,10 @@
 //! - **Transaction Management**: Transaction commits and durations
 //! - **Error Tracking**: Database-level error monitoring
 //! - **Storage Performance**: Key-value operation metrics
+//!
+//! These metrics are recorded centrally by the typed KV layer
+//! ([`crate::backend::kv::rocksdb`]) — every RocksDB get/put/delete/commit goes
+//! through it — rather than scattered across the backend's methods.
 
 use std::sync::OnceLock;
 
@@ -24,22 +28,18 @@ static ROCKSDB_METRICS: OnceLock<RocksDbPerformanceMetrics> = OnceLock::new();
 /// following OpenTelemetry semantic conventions for database monitoring.
 pub struct RocksDbPerformanceMetrics {
     // === Database Operations ===
-    /// Total number of RocksDB batch write operations
-    pub db_batch_writes_total: Counter<u64>,
     /// Total number of RocksDB get operations (key lookups)
-    pub db_gets_total:         Counter<u64>,
+    pub db_gets_total:    Counter<u64>,
     /// Total number of RocksDB put operations (key writes)
-    pub db_puts_total:         Counter<u64>,
+    pub db_puts_total:    Counter<u64>,
     /// Total number of RocksDB delete operations
-    pub db_deletes_total:      Counter<u64>,
+    pub db_deletes_total: Counter<u64>,
 
     // === Performance Metrics ===
-    /// Histogram of RocksDB write operation latencies in milliseconds
-    pub db_write_duration_ms: Histogram<f64>,
     /// Histogram of RocksDB get operation latencies in milliseconds
-    pub db_get_duration_ms:   Histogram<f64>,
+    pub db_get_duration_ms: Histogram<f64>,
     /// Histogram of RocksDB put operation latencies in milliseconds
-    pub db_put_duration_ms:   Histogram<f64>,
+    pub db_put_duration_ms: Histogram<f64>,
 
     // === Transaction Metrics ===
     /// Total number of RocksDB transaction commits
@@ -68,11 +68,6 @@ impl RocksDbPerformanceMetrics {
 
         Self {
             // Database Operations
-            db_batch_writes_total: meter
-                .u64_counter("kiseki_rocksdb_batch_writes_total")
-                .with_description("Total number of RocksDB batch write operations")
-                .build(),
-
             db_gets_total: meter
                 .u64_counter("kiseki_rocksdb_gets_total")
                 .with_description("Total number of RocksDB get operations")
@@ -89,11 +84,6 @@ impl RocksDbPerformanceMetrics {
                 .build(),
 
             // Performance Metrics
-            db_write_duration_ms: meter
-                .f64_histogram("kiseki_rocksdb_write_duration_ms")
-                .with_description("RocksDB write operation latency in milliseconds")
-                .build(),
-
             db_get_duration_ms: meter
                 .f64_histogram("kiseki_rocksdb_get_duration_ms")
                 .with_description("RocksDB get operation latency in milliseconds")
@@ -133,11 +123,6 @@ pub fn get_rocksdb_metrics() -> &'static RocksDbPerformanceMetrics {
 
 /// Macro for RocksDB operation counter increments
 macro_rules! rocksdb_counter {
-    (db_batch_writes_total) => {{
-        crate::backend::rocksdb_metrics::get_rocksdb_metrics()
-            .db_batch_writes_total
-            .add(1, &[]);
-    }};
     (db_gets_total) => {{
         crate::backend::rocksdb_metrics::get_rocksdb_metrics()
             .db_gets_total
@@ -162,11 +147,6 @@ macro_rules! rocksdb_counter {
 
 /// Macro for RocksDB histogram operations
 macro_rules! rocksdb_histogram {
-    (db_write_duration_ms, $value:expr) => {{
-        crate::backend::rocksdb_metrics::get_rocksdb_metrics()
-            .db_write_duration_ms
-            .record($value, &[]);
-    }};
     (db_get_duration_ms, $value:expr) => {{
         crate::backend::rocksdb_metrics::get_rocksdb_metrics()
             .db_get_duration_ms
@@ -208,16 +188,7 @@ macro_rules! rocksdb_timed_op {
     }};
 }
 
-/// Simple macro for recording delete operations (no timing needed for batch
-/// operations)
-macro_rules! rocksdb_delete {
-    () => {{
-        rocksdb_counter!(db_deletes_total);
-    }};
-}
-
 pub(crate) use rocksdb_counter;
-pub(crate) use rocksdb_delete;
 pub(crate) use rocksdb_error;
 pub(crate) use rocksdb_histogram;
 pub(crate) use rocksdb_timed_op;

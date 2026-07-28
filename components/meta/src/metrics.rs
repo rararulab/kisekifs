@@ -298,7 +298,7 @@ pub fn record_operation_error(error_type: &str, operation: &str) {
 
 /// Example usage of metrics macros with constants
 ///
-/// ```rust
+/// ```ignore
 /// use kiseki_meta::{metrics_counter, metrics_cache, metrics_business_op};
 /// use kiseki_meta::metrics::labels;
 ///
@@ -424,7 +424,7 @@ macro_rules! metrics_histogram_with_labels {
 /// dropped
 ///
 /// Usage:
-/// ```rust
+/// ```ignore
 /// let _timer = metrics_start_timer!(lookup_duration_ms);
 /// // ... do operation
 /// // Timer automatically records duration when _timer goes out of scope

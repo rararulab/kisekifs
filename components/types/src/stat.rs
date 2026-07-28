@@ -19,7 +19,7 @@ use std::fmt::{Debug, Formatter};
 use kiseki_utils::readable_size::ReadableSize;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DirStat {
     pub length: i64,
     pub space:  i64,

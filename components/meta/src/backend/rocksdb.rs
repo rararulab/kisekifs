@@ -29,27 +29,26 @@ use kiseki_types::{
     entry::DEntry,
     ino::{Ino, ROOT_INO, ZERO_INO},
     setting::Format,
-    slice::{EMPTY_SLICE_ID, SLICE_BYTES, Slice, Slices},
+    slice::{EMPTY_SLICE_ID, Slice, Slices},
     stat::DirStat,
 };
-use rocksdb::{DBAccess, MultiThreaded};
-use serde::Serialize;
-use snafu::{OptionExt, ResultExt, ensure};
+use snafu::{IntoError, OptionExt, ensure};
 use tracing::{debug, error};
 
-// Import RocksDB metrics macros from internal module
-use super::rocksdb_metrics::{
-    rocksdb_counter, rocksdb_delete, rocksdb_error, rocksdb_histogram, rocksdb_timed_op,
-};
 use super::{
-    Backend, RenameResult, SliceCommitResult, UnlinkResult, key, key::Counter as BackendCounter,
+    Backend, RenameResult, SliceCommitResult, UnlinkResult, key::Counter as BackendCounter,
 };
 use crate::{
+    backend::kv::{
+        KvEngine, KvRead, KvReadExt, KvTxn, KvTxnExt,
+        key::{self, MetaKey},
+        rocksdb::RocksDbKv,
+        value,
+    },
     context::FuseContext,
     engine::RenameFlags,
     err::{
-        AlreadyInitializedSnafu, LibcSnafu, ModelSnafu, Result, RocksdbSnafu,
-        UninitializedEngineSnafu, model_err, model_err::ModelKind,
+        AlreadyInitializedSnafu, LibcSnafu, ModelSnafu, Result, UninitializedEngineSnafu, model_err,
     },
     open_files::OpenFilesRef,
 };
@@ -57,9 +56,10 @@ use crate::{
 /// **POSIX-Compliant Meta Storage Backend Implementation using RocksDB**
 ///
 /// This module implements a complete POSIX-compliant filesystem metadata
-/// storage layer using RocksDB as the underlying persistent storage engine. All
-/// operations follow POSIX.1-2008 standard semantics to ensure compatibility
-/// with standard UNIX filesystems.
+/// storage layer. All persistence goes through the storage-agnostic typed
+/// key/value layer ([`crate::backend::kv`]); this file is concerned only with
+/// POSIX.1-2008 semantics (permissions, hard-link counting, sticky bits,
+/// atomic multi-key mutations) expressed on top of that layer.
 ///
 /// # POSIX Compliance Architecture
 ///
@@ -88,10 +88,11 @@ use crate::{
 /// - `truncate(2)`: Modify file size atomically
 ///
 /// ## Transaction Model:
-/// Complex operations (rename, rmdir) use RocksDB transactions to ensure
-/// atomicity. Simple operations use direct writes for performance. All error
-/// conditions follow POSIX error code conventions (EEXIST, ENOTEMPTY, EACCES,
-/// etc.).
+/// Complex operations (mknod, rmdir, rename, ...) run inside a single
+/// [`KvEngine::transaction`] closure that commits once and retries on
+/// optimistic conflict. Simple point reads/writes use the non-transactional
+/// snapshot helpers. All error conditions follow POSIX error code conventions
+/// (EEXIST, ENOTEMPTY, EACCES, etc.).
 ///
 /// ## Permission and Security:
 /// Implements full POSIX permission checking including:
@@ -99,12 +100,6 @@ use crate::{
 /// - Special permission bits (setuid, setgid, sticky bit)
 /// - Sticky bit directory protection for secure deletion
 /// - Immutable and append-only file attribute support
-///
-/// ## Data Consistency Guarantees:
-/// - All metadata updates are atomic at the RocksDB level
-/// - Batch operations ensure multiple related updates commit together
-/// - Transaction isolation prevents partial state visibility
-/// - Write-ahead logging provides crash recovery
 ///
 /// Constants for file permissions and operation modes - POSIX compliant
 mod constants {
@@ -118,69 +113,6 @@ mod constants {
     #[allow(dead_code)] // Used in specific Linux filesystem scenarios
     pub const MODE_MASK_SETGID_EXEC: u32 = 0o2010;
     pub const DEFAULT_FILE_SIZE: u64 = 4096;
-}
-
-/// Macro for deserializing values from RocksDB with unified error handling
-macro_rules! deserialize_db {
-    ($db:expr, $key:expr, $typ:ty, $kind:expr) => {{
-        let buf = $db
-            .get_pinned_opt(&$key, &rocksdb::ReadOptions::default())
-            .context(RocksdbSnafu)?
-            .context(model_err::NotFoundSnafu {
-                kind: $kind,
-                key:  String::from_utf8_lossy(&$key).to_string(),
-            })
-            .context(ModelSnafu)?;
-
-        bincode::deserialize::<$typ>(&buf)
-            .context(model_err::CorruptionSnafu {
-                kind: $kind,
-                key:  String::from_utf8_lossy(&$key).to_string(),
-            })
-            .context(ModelSnafu)?
-    }};
-}
-
-/// Macro for serializing values to write batch with unified error handling
-macro_rules! serialize_batch {
-    ($batch:expr, $key:expr, $value:expr, $kind:expr) => {{
-        let buf = bincode::serialize(&$value)
-            .context(model_err::CorruptionSnafu {
-                kind: $kind,
-                key:  String::from_utf8_lossy(&$key).to_string(),
-            })
-            .context(ModelSnafu)?;
-        $batch.put(&$key, buf);
-        rocksdb_counter!(db_puts_total);
-    }};
-}
-
-/// Macro for database operations with automatic error context and metrics
-macro_rules! db_try {
-    ($op:expr) => {
-        match $op {
-            Ok(result) => result,
-            Err(e) => {
-                rocksdb_error!(crate::metrics::labels::ERROR_ROCKSDB);
-                return Err(e).context(RocksdbSnafu);
-            }
-        }
-    };
-}
-
-/// Macro for model operations with automatic error context
-macro_rules! model_try {
-    ($op:expr) => {
-        $op.context(ModelSnafu)?
-    };
-}
-
-/// Macro for unified batch operations
-macro_rules! batch_put {
-    ($batch:expr, $key:expr, $value:expr, $kind:expr) => {{
-        serialize_batch!($batch, $key, $value, $kind);
-        Ok(())
-    }};
 }
 
 #[derive(Debug, Default)]
@@ -201,240 +133,91 @@ impl Builder {
     }
 
     pub fn build(&self) -> Result<Arc<dyn Backend>> {
-        let mut opts = rocksdb::Options::default();
-        opts.create_if_missing(true);
-        opts.create_missing_column_families(true);
-        opts.increase_parallelism(kiseki_utils::num_cpus() as i32);
-
-        let db = rocksdb::OptimisticTransactionDB::open(&opts, &self.path).context(RocksdbSnafu)?;
+        let kv = RocksDbKv::open(&self.path)?;
         Ok(Arc::new(RocksdbBackend {
-            db,
+            kv,
             skip_dir_mtime: self.skip_dir_mtime,
         }))
     }
 }
 
 pub(crate) struct RocksdbBackend {
-    db:             rocksdb::OptimisticTransactionDB<MultiThreaded>,
+    kv:             RocksDbKv,
     skip_dir_mtime: Duration,
 }
 
 impl Debug for RocksdbBackend {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         let mut ds = f.debug_struct("RocksdbEngine");
-        ds.field("path", &self.db.path());
+        ds.field("path", &self.kv.path());
         ds.finish()
     }
 }
 
-/// Retrieve symbolic link target path - POSIX readlink(2) semantics
-/// implementation
-///
-/// POSIX Compliance Requirements:
-/// - POSIX.1-2008 readlink(2): Symbolic links must atomically return the target
-///   path
-/// - Data Consistency: Symlink content must remain exactly as created
-/// - Error Handling: Return appropriate POSIX error codes if inode doesn't
-///   exist or isn't a symlink
-/// - Durability Guarantee: Symlink data must be read from persistent storage
-///
-/// Implementation Details:
-/// - Uses pinned read to avoid data copying for performance
-/// - Direct RocksDB read ensures data consistency
-/// - Error context provides debugging information for POSIX error mapping
-/// - Metrics: Records database read operations and timings
-fn do_get_symlink<Layer: DBAccess>(db: &Layer, inode: Ino) -> Result<Bytes> {
-    let symlink_key = key::symlink(inode);
-
-    // Record the database read operation with metrics
-    let buf = rocksdb_timed_op!(
-        db_gets_total,
-        db_get_duration_ms,
-        db.get_pinned_opt(&symlink_key, &rocksdb::ReadOptions::default())
-    )
-    .context(RocksdbSnafu)?
-    .context(model_err::NotFoundSnafu {
-        kind: ModelKind::Symlink,
-        key:  String::from_utf8_lossy(&symlink_key).to_string(),
-    })
-    .context(ModelSnafu)?;
-
-    Ok(Bytes::from(buf.to_vec()))
+/// Current wall-clock time expressed as whole seconds since the UNIX epoch.
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
 }
-/// Get hard link count for specific parent-child relationship - POSIX link
-/// counting semantics
+
+/// Check whether a directory has any children - POSIX rmdir(2) empty-directory
+/// validation.
 ///
-/// POSIX Compliance Requirements:
-/// - POSIX.1-2008 link(2)/unlink(2): Hard link count must be accurately
-///   maintained
-/// - Atomicity: Link count operations must be atomic to prevent race conditions
-/// - Consistency: Count must reflect the actual number of directory entries
-///   pointing to the inode
-/// - Zero Count Handling: When count reaches zero, file data should be eligible
-///   for deletion
+/// A directory may only be removed (or replaced during rename) when it holds no
+/// entries besides "." and "..". Performing the check inside the surrounding
+/// transaction prevents TOCTOU races with concurrent additions.
+fn do_check_exist_children(txn: &mut dyn KvTxn, parent: Ino) -> Result<bool> {
+    Ok(!txn.scan(&key::DentryPrefix(parent), Some(1))?.is_empty())
+}
+
+/// Read the hard-link count for a specific inode/parent relationship,
+/// defaulting to zero when the relationship has never been recorded. Uses a
+/// write-intent read because every caller immediately updates the count.
+fn get_hard_link_count(txn: &mut dyn KvTxn, inode: Ino, parent: Ino) -> Result<u64> {
+    Ok(txn
+        .get_for_update(&key::HardLink(inode, parent))?
+        .unwrap_or(0))
+}
+
+/// Append a slice to a chunk's packed slice list within a transaction, skipping
+/// the append when an identical slice is already present.
 ///
-/// Implementation Details:
-/// - Each parent-child relationship is stored separately for fine-grained
-///   control
-/// - Returns 0 for non-existent relationships (safe default for POSIX
-///   semantics)
-/// - Uses bincode for efficient serialization of count values
-fn do_get_hard_link_count<Layer: DBAccess>(db: &Layer, inode: Ino, parent: Ino) -> Result<u64> {
-    let key = key::parent(inode, parent);
-    let buf = rocksdb_timed_op!(
-        db_gets_total,
-        db_get_duration_ms,
-        db_try!(db.get_pinned_opt(&key, &rocksdb::ReadOptions::default()))
-    );
-    match buf {
-        Some(buf) => {
-            let count: u64 = model_try!(bincode::deserialize(&buf).context(
-                model_err::CorruptionSnafu {
-                    kind: ModelKind::HardLinkCount,
-                    key:  String::from_utf8_lossy(&key).to_string(),
-                }
-            ));
-            Ok(count)
-        }
-        None => Ok(0),
+/// Returns `(inserted, slice_count)`: whether a new record was appended and the
+/// resulting number of slices. Deduplication compares the candidate slice
+/// against the existing records; `Slice`'s value equality is exactly its
+/// 28-byte (`SLICE_BYTES`) encoding equality.
+fn stage_chunk_slice(
+    txn: &mut dyn KvTxn,
+    inode: Ino,
+    chunk_index: ChunkIndex,
+    slice: &Slice,
+) -> Result<(bool, usize)> {
+    let key = key::ChunkSlices(inode, chunk_index);
+    let mut slices = txn
+        .get_for_update(&key)?
+        .unwrap_or_else(|| Slices(Vec::new()));
+    let inserted = !slices.0.iter().any(|existing| existing == slice);
+    if inserted {
+        slices.0.push(slice.clone());
+        txn.put(&key, &slices)?;
     }
+    Ok((inserted, slices.0.len()))
 }
 
-/// Get directory entry by parent inode and name - POSIX directory lookup
-/// semantics
+/// Commit a slice into a file's chunk and reconcile the inode length.
 ///
-/// POSIX Compliance Requirements:
-/// - POSIX.1-2008 opendir(3)/readdir(3): Directory entries must be consistently
-///   retrievable
-/// - Name Resolution: Exact string matching for file names (case-sensitive on
-///   most systems)
-/// - Atomicity: Directory entry lookup must be atomic and consistent
-/// - Error Handling: Must distinguish between "not found" vs "permission
-///   denied" vs "I/O error"
-///
-/// Implementation Details:
-/// - Uses composite key (parent_ino, name) for direct O(1) lookup
-/// - Deserializes DEntry structure containing inode number and file type
-/// - Provides proper error context for POSIX error code mapping
-fn do_get_dentry<Layer: DBAccess>(db: &Layer, parent: Ino, name: &str) -> Result<DEntry> {
-    let entry_key = key::dentry(parent, name);
-    Ok(deserialize_db!(db, entry_key, DEntry, ModelKind::DEntry))
-}
-
-/// Get inode attributes - POSIX stat(2) semantics implementation
-///
-/// POSIX Compliance Requirements:
-/// - POSIX.1-2008 stat(2)/fstat(2)/lstat(2): File attributes must be consistent
-///   and accurate
-/// - Timestamp Consistency: atime, mtime, ctime must follow POSIX update rules
-/// - Permission Bits: Mode bits must conform to POSIX permission model
-///   (owner/group/other)
-/// - File Type: Must correctly identify file type (regular, directory, symlink,
-///   etc.)
-/// - Link Count: nlink must accurately reflect number of hard links
-///
-/// Implementation Details:
-/// - Directly deserializes InodeAttr from persistent storage
-/// - Single atomic read operation ensures consistency
-/// - Error handling distinguishes between corruption and missing inode
-/// - Metrics: Records database read operations for stat calls
-fn do_get_attr<Layer: DBAccess>(db: &Layer, inode: Ino) -> Result<InodeAttr> {
-    let attr_key = key::attr(inode);
-
-    // Record database read with metrics and use our deserialize macro
-    let result = rocksdb_timed_op!(
-        db_gets_total,
-        db_get_duration_ms,
-        deserialize_db!(db, attr_key, InodeAttr, ModelKind::Attr)
-    );
-
-    Ok(result)
-}
-
-/// Check if directory has any children - POSIX rmdir(2) empty directory
-/// validation
-///
-/// POSIX Compliance Requirements:
-/// - POSIX.1-2008 rmdir(2): Directory must be empty before removal (except for
-///   "." and "..")
-/// - Atomicity: Check must be performed within same transaction as removal
-/// - Consistency: Must detect all types of children (files, directories,
-///   symlinks)
-/// - Race Condition Prevention: Using transaction ensures no concurrent
-///   additions
-///
-/// Implementation Details:
-/// - Uses RocksDB iterator to efficiently check for any directory entries
-/// - Prefix-based iteration ensures we only check children of the specified
-///   parent
-/// - Returns immediately upon finding first child (short-circuit optimization)
-/// - Transaction-based operation prevents TOCTOU (Time-Of-Check-Time-Of-Use)
-///   races
-fn do_check_exist_children<DB>(txn: &rocksdb::Transaction<DB>, parent: Ino) -> Result<bool> {
-    let prefix = key::dentry_prefix(parent);
-    let mut ro = rocksdb::ReadOptions::default();
-    ro.set_iterate_range(rocksdb::PrefixRange(prefix.as_slice()));
-    let mut iter = txn.raw_iterator_opt(ro);
-    iter.seek_to_first();
-    Ok(iter.valid())
-}
-
-/// Store inode attributes within transaction context - POSIX transactional
-/// metadata update
-///
-/// POSIX Compliance Requirements:
-/// - POSIX.1-2008: Complex operations require atomic metadata updates
-/// - Transaction Consistency: Attribute updates must be part of larger atomic
-///   operations
-/// - Isolation: Changes not visible until transaction commits (ACID properties)
-/// - Rollback Safety: Failed transactions must not leave partial attribute
-///   updates
-///
-/// Implementation Details:
-/// - Uses transaction put operation for isolation and atomicity
-/// - Consistent with batch operations but within transaction boundary
-/// - Essential for complex operations like rename, mknod that update multiple
-///   entities
-/// - Error context helps diagnose serialization or storage issues
-fn txn_put_attr<DB>(txn: &rocksdb::Transaction<DB>, inode: Ino, attr: &InodeAttr) -> Result<()> {
-    let attr_key = key::attr(inode);
-    let buf = model_try!(
-        bincode::serialize(attr).context(model_err::CorruptionSnafu {
-            kind: ModelKind::Attr,
-            key:  String::from_utf8_lossy(&attr_key).to_string(),
-        })
-    );
-    rocksdb_timed_op!(
-        db_puts_total,
-        db_put_duration_ms,
-        db_try!(txn.put(&attr_key, &buf))
-    );
-    Ok(())
-}
-
+/// Grows `InodeAttr.length` when the slice extends past the current end of file
+/// and refreshes the modification time whenever a slice is newly inserted or
+/// the file grows, mirroring POSIX write semantics.
 fn stage_slice_commit(
-    txn: &rocksdb::Transaction<rocksdb::OptimisticTransactionDB<MultiThreaded>>,
+    txn: &mut dyn KvTxn,
     inode: Ino,
     chunk_index: ChunkIndex,
     slice: &Slice,
 ) -> Result<SliceCommitResult> {
-    let attr_key = key::attr(inode);
-    let attr_buf = rocksdb_timed_op!(
-        db_gets_total,
-        db_get_duration_ms,
-        db_try!(txn.get_for_update(&attr_key, true))
-    )
-    .context(model_err::NotFoundSnafu {
-        kind: ModelKind::Attr,
-        key:  String::from_utf8_lossy(&attr_key).to_string(),
-    })
-    .context(ModelSnafu)?;
-    let mut attr: InodeAttr = model_try!(bincode::deserialize(&attr_buf).context(
-        model_err::CorruptionSnafu {
-            kind: ModelKind::Attr,
-            key:  String::from_utf8_lossy(&attr_key).to_string(),
-        }
-    ));
+    let mut attr = txn.get_for_update_or_missing(&key::Attr(inode))?;
     ensure!(attr.is_file(), LibcSnafu { errno: libc::EPERM });
 
     let (inserted, slice_count) = stage_chunk_slice(txn, inode, chunk_index, slice)?;
@@ -448,7 +231,7 @@ fn stage_slice_commit(
             attr.length = new_len;
         }
         attr.update_modification_time();
-        txn_put_attr(txn, inode, &attr)?;
+        txn.put(&key::Attr(inode), &attr)?;
     }
 
     Ok(SliceCommitResult {
@@ -458,296 +241,55 @@ fn stage_slice_commit(
     })
 }
 
-fn stage_chunk_slice(
-    txn: &rocksdb::Transaction<rocksdb::OptimisticTransactionDB<MultiThreaded>>,
-    inode: Ino,
-    chunk_index: ChunkIndex,
-    slice: &Slice,
-) -> Result<(bool, usize)> {
-    let slices_key = key::chunk_slices(inode, chunk_index);
-    let mut slices_buf = rocksdb_timed_op!(
-        db_gets_total,
-        db_get_duration_ms,
-        db_try!(txn.get_for_update(&slices_key, true))
-    )
-    .unwrap_or_default();
-    if !slices_buf.len().is_multiple_of(SLICE_BYTES) {
-        return Err(model_err::Error::CorruptionString {
-            kind:   ModelKind::ChunkSlices,
-            key:    String::from_utf8_lossy(&slices_key).to_string(),
-            reason: format!("invalid encoded slice length {}", slices_buf.len()),
-        })
-        .context(ModelSnafu);
-    }
-    let encoded_slice = model_try!(
-        bincode::serialize(slice).context(model_err::CorruptionSnafu {
-            kind: ModelKind::ChunkSlices,
-            key:  String::from_utf8_lossy(&slices_key).to_string(),
-        })
-    );
-    let inserted = !slices_buf
-        .chunks_exact(SLICE_BYTES)
-        .any(|existing| existing == encoded_slice);
-    if inserted {
-        slices_buf.extend_from_slice(&encoded_slice);
-        rocksdb_timed_op!(
-            db_puts_total,
-            db_put_duration_ms,
-            db_try!(txn.put(&slices_key, &slices_buf))
-        );
-    }
-    Ok((inserted, slices_buf.len() / SLICE_BYTES))
-}
-
-fn set_dentry_in_write_batch<const TRANSACTION: bool>(
-    batch: &mut rocksdb::WriteBatchWithTransaction<TRANSACTION>,
-    parent: Ino,
-    name: &str,
-    inode: Ino,
-    typ: FileType,
-) -> Result<()> {
-    let entry_key = key::dentry(parent, name);
-    let entry = DEntry {
-        parent,
-        name: name.to_string(),
-        inode,
-        typ,
-    };
-    batch_put!(batch, entry_key, entry, ModelKind::DEntry)
-}
-
-/// Add inode attribute update to write batch - POSIX atomic batch operation
-///
-/// POSIX Compliance Requirements:
-/// - POSIX.1-2008: Metadata updates must be atomic with related operations
-/// - Batch Consistency: Multiple metadata updates must be applied atomically
-/// - Transaction Support: Must work within transaction context for complex
-///   operations
-/// - Durability: Changes must be persistent once batch is committed
-///
-/// Implementation Details:
-/// - Uses generic const parameter to support both transactional and
-///   non-transactional batches
-/// - Leverages batch_put! macro for consistent error handling and serialization
-/// - Part of larger atomic operations (mknod, rename, etc.)
-fn set_attr_in_write_batch<const TRANSACTION: bool>(
-    batch: &mut rocksdb::WriteBatchWithTransaction<TRANSACTION>,
-    inode: Ino,
-    attr: &InodeAttr,
-) -> Result<()> {
-    let attr_key = key::attr(inode);
-    batch_put!(batch, attr_key, attr, ModelKind::Attr)
-}
-
-fn set_hard_link_count_in_write_batch<const TRANSACTION: bool>(
-    batch: &mut rocksdb::WriteBatchWithTransaction<TRANSACTION>,
-    inode: Ino,
-    parent: Ino,
-    cnt: u64,
-) -> Result<()> {
-    let key = key::parent(inode, parent);
-    set_value_in_write_batch(batch, ModelKind::HardLinkCount, key.as_slice(), cnt)
-}
-
-fn set_sustained_in_write_batch<const TRANSACTION: bool>(
-    batch: &mut rocksdb::WriteBatchWithTransaction<TRANSACTION>,
-    session_id: u64,
-    inode: Ino,
-    sustained: u64,
-) -> Result<()> {
-    let key = key::sustained(session_id, inode);
-    set_value_in_write_batch(batch, ModelKind::Sustained, key.as_slice(), sustained)
-}
-
-// set_delete_chunk_after_in_write_batch write a notification that we need to
-// delete the chunk after a while.
-fn set_delete_chunk_after_in_write_batch<const TRANSACTION: bool>(
-    batch: &mut rocksdb::WriteBatchWithTransaction<TRANSACTION>,
-    inode: Ino,
-) -> Result<()> {
-    let key = key::delete_chunk_after(inode);
-    set_value_in_write_batch(
-        batch,
-        ModelKind::DeleteInode,
-        key.as_slice(),
-        SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_secs(),
-    )
-}
-
-fn set_value_in_write_batch<const TRANSACTION: bool, V>(
-    batch: &mut rocksdb::WriteBatchWithTransaction<TRANSACTION>,
-    kind: ModelKind,
-    key: &[u8],
-    value: V,
-) -> Result<()>
-where
-    V: Serialize,
-{
-    let buf = bincode::serialize(&value)
-        .context(model_err::CorruptionSnafu {
-            kind,
-            key: String::from_utf8_lossy(key).to_string(),
-        })
-        .context(ModelSnafu)?;
-    batch.put(key, buf);
-    rocksdb_counter!(db_puts_total);
-    Ok(())
-}
-
-fn delete_prefix_in_txn_write_batch(
-    txn: &rocksdb::Transaction<rocksdb::OptimisticTransactionDB<MultiThreaded>>,
-    batch: &mut rocksdb::WriteBatchWithTransaction<true>,
-    prefix: &[u8],
-) {
-    let mut ro = rocksdb::ReadOptions::default();
-    ro.set_iterate_range(rocksdb::PrefixRange(prefix));
-    let mut iter = txn.raw_iterator_opt(ro);
-    iter.seek_to_first();
-    // Scan the keys in the iterator
-    while let Some(k) = iter.key() {
-        if !k.starts_with(prefix) {
-            break;
-        }
-        batch.delete(k);
-        iter.next();
-    }
-}
-
-fn stage_initial_state(
-    txn: &rocksdb::Transaction<rocksdb::OptimisticTransactionDB<MultiThreaded>>,
-    format: &Format,
-    root: &InodeAttr,
-) -> Result<()> {
-    let format_buf = model_try!(
-        bincode::serialize(format).context(model_err::CorruptionSnafu {
-            kind: ModelKind::Setting,
-            key:  key::CURRENT_FORMAT.to_string(),
-        })
-    );
-    let root_key = key::attr(ROOT_INO);
-    let root_buf = model_try!(
-        bincode::serialize(root).context(model_err::CorruptionSnafu {
-            kind: ModelKind::Attr,
-            key:  String::from_utf8_lossy(&root_key).to_string(),
-        })
-    );
-    let counter_key: Vec<u8> = BackendCounter::NextInode.into();
-    let counter_buf = model_try!(
-        bincode::serialize(&2u64).context(model_err::CorruptionSnafu {
-            kind: ModelKind::Counter,
-            key:  String::from_utf8_lossy(&counter_key).to_string(),
-        })
-    );
-
-    db_try!(txn.put(key::CURRENT_FORMAT, format_buf));
-    db_try!(txn.put(root_key, root_buf));
-    db_try!(txn.put(counter_key, counter_buf));
-    rocksdb_counter!(db_puts_total);
-    rocksdb_counter!(db_puts_total);
-    rocksdb_counter!(db_puts_total);
+/// Stage the initial volume state (format, root inode, next-inode counter)
+/// inside a transaction. Committed atomically by the caller so an aborted
+/// initialization leaves no partial state behind.
+fn stage_initial_state(txn: &mut dyn KvTxn, format: &Format, root: &InodeAttr) -> Result<()> {
+    txn.put(&key::FormatKey, format)?;
+    txn.put(&key::Attr(ROOT_INO), root)?;
+    txn.put(&key::CounterKey(BackendCounter::NextInode), &2u64)?;
     Ok(())
 }
 
 #[async_trait::async_trait]
 impl Backend for RocksdbBackend {
     fn initialize_volume(&self, format: &Format, root: &InodeAttr) -> Result<()> {
-        let transaction = self.db.transaction();
-        let current = rocksdb_timed_op!(
-            db_gets_total,
-            db_get_duration_ms,
-            db_try!(transaction.get_for_update(key::CURRENT_FORMAT, true))
-        );
-        ensure!(current.is_none(), AlreadyInitializedSnafu);
-
-        stage_initial_state(&transaction, format, root)?;
-        rocksdb_timed_op!(
-            db_transactions_total,
-            db_transaction_duration_ms,
-            db_try!(transaction.commit())
-        );
-        Ok(())
+        self.kv.transaction(|txn| {
+            ensure!(
+                txn.get_for_update(&key::FormatKey)?.is_none(),
+                AlreadyInitializedSnafu
+            );
+            stage_initial_state(txn, format, root)?;
+            Ok(())
+        })
     }
 
     fn set_format(&self, format: &Format) -> Result<()> {
-        let setting_buf = model_try!(bincode::serialize(format).context(
-            model_err::CorruptionSnafu {
-                kind: ModelKind::Setting,
-                key:  key::CURRENT_FORMAT.to_string(),
-            }
-        ));
-
-        rocksdb_timed_op!(
-            db_puts_total,
-            db_put_duration_ms,
-            db_try!(self.db.put(key::CURRENT_FORMAT, setting_buf))
-        );
-        Ok(())
+        self.kv.transaction(|txn| txn.put(&key::FormatKey, format))
     }
 
     fn load_format(&self) -> Result<Format> {
-        let setting_buf = rocksdb_timed_op!(
-            db_gets_total,
-            db_get_duration_ms,
-            db_try!(self.db.get_pinned(key::CURRENT_FORMAT))
-        )
-        .context(UninitializedEngineSnafu)?;
-        let setting: Format = model_try!(bincode::deserialize(&setting_buf).context(
-            model_err::CorruptionSnafu {
-                kind: ModelKind::Setting,
-                key:  key::CURRENT_FORMAT.to_string(),
-            }
-        ));
-        Ok(setting)
+        self.kv
+            .get(&key::FormatKey)?
+            .context(UninitializedEngineSnafu)
     }
 
     fn increase_count_by(&self, counter: BackendCounter, step: usize) -> Result<u64> {
-        let key: Vec<u8> = counter.into();
-        let transaction = self.db.transaction();
-        let current = rocksdb_timed_op!(
-            db_gets_total,
-            db_get_duration_ms,
-            db_try!(transaction.get(&key))
-        )
-        .map(|v| {
-            bincode::deserialize::<u64>(&v)
-                .context(model_err::CorruptionSnafu {
-                    kind: ModelKind::Counter,
-                    key:  String::from_utf8_lossy(&key).to_string(),
-                })
-                .context(ModelSnafu)
+        self.kv.transaction(|txn| {
+            let current = txn.get_for_update(&key::CounterKey(counter))?.unwrap_or(0);
+            let new = current + step as u64;
+            txn.put(&key::CounterKey(counter), &new)?;
+            Ok(new)
         })
-        .transpose()?
-        .unwrap_or(0u64);
-
-        let new = current + step as u64;
-        let new_buf = model_try!(
-            bincode::serialize(&new).context(model_err::CorruptionSnafu {
-                kind: ModelKind::Counter,
-                key:  String::from_utf8_lossy(&key).to_string(),
-            })
-        );
-        rocksdb_timed_op!(
-            db_puts_total,
-            db_put_duration_ms,
-            db_try!(transaction.put(&key, new_buf))
-        );
-        rocksdb_timed_op!(
-            db_transactions_total,
-            db_transaction_duration_ms,
-            db_try!(transaction.commit())
-        );
-        Ok(new)
     }
 
     fn load_count(&self, counter: BackendCounter) -> Result<u64> {
-        let key: Vec<u8> = counter.into();
-        Ok(deserialize_db!(self.db, key, u64, ModelKind::Counter))
+        self.kv.get_or_missing(&key::CounterKey(counter))
     }
 
-    fn get_attr(&self, inode: Ino) -> Result<InodeAttr> { do_get_attr(&self.db, inode) }
+    fn get_attr(&self, inode: Ino) -> Result<InodeAttr> {
+        self.kv.get_or_missing(&key::Attr(inode))
+    }
 
     /// Set/update inode attributes - POSIX metadata storage implementation
     ///
@@ -761,124 +303,51 @@ impl Backend for RocksdbBackend {
     /// - Permission Model: Mode bits must conform to POSIX owner/group/other
     ///   model
     /// - Atomicity: Attribute updates must be atomic to prevent partial state
-    ///
-    /// Implementation Details:
-    /// - Uses bincode serialization for efficient storage and retrieval
-    /// - Single put operation ensures atomicity at RocksDB level
-    /// - Error handling provides context for debugging metadata corruption
-    /// - Direct write to persistent storage ensures durability
     fn set_attr(&self, inode: Ino, attr: &InodeAttr) -> Result<()> {
-        let attr_key = key::attr(inode);
-        let buf = model_try!(
-            bincode::serialize(attr).context(model_err::CorruptionSnafu {
-                kind: ModelKind::Attr,
-                key:  String::from_utf8_lossy(&attr_key).to_string(),
-            })
-        );
-        rocksdb_timed_op!(
-            db_puts_total,
-            db_put_duration_ms,
-            db_try!(self.db.put(&attr_key, &buf))
-        );
-        Ok(())
+        self.kv.transaction(|txn| txn.put(&key::Attr(inode), attr))
     }
 
     fn get_dentry(&self, parent: Ino, name: &str) -> Result<DEntry> {
-        do_get_dentry(&self.db, parent, name)
+        self.kv.get_or_missing(&key::Dentry(parent, name))
     }
 
     fn set_dentry(&self, parent: Ino, name: &str, inode: Ino, typ: FileType) -> Result<()> {
-        let entry_key = key::dentry(parent, name);
         let entry = DEntry {
             parent,
             name: name.to_string(),
             inode,
             typ,
         };
-        let entry_buf = model_try!(bincode::serialize(&entry).context(
-            model_err::CorruptionSnafu {
-                kind: ModelKind::DEntry,
-                key:  String::from_utf8_lossy(&entry_key).to_string(),
-            }
-        ));
-        rocksdb_timed_op!(
-            db_puts_total,
-            db_put_duration_ms,
-            db_try!(self.db.put(&entry_key, entry_buf))
-        );
-        Ok(())
+        self.kv
+            .transaction(|txn| txn.put(&key::Dentry(parent, name), &entry))
     }
 
     fn list_dentry(&self, parent: Ino, limit: i64) -> Result<Vec<DEntry>> {
-        let prefix = key::dentry_prefix(parent);
-        let mut ro = rocksdb::ReadOptions::default();
-        ro.set_iterate_range(rocksdb::PrefixRange(prefix.as_slice()));
-        let mut iter = self.db.raw_iterator_opt(ro);
-        iter.seek_to_first();
-        let mut res = Vec::default();
-        // Scan the keys in the iterator
-        while iter.valid() {
-            // Check the scan limit
-            if limit == -1 || res.len() < limit as usize {
-                // Get the key and value
-                let (k, v) = (iter.key(), iter.value());
-                // Check the key and value
-                if let (Some(k), Some(v)) = (k, v) {
-                    let dentry: DEntry =
-                        model_try!(bincode::deserialize(v).context(model_err::CorruptionSnafu {
-                            kind: ModelKind::DEntry,
-                            key:  String::from_utf8_lossy(k).to_string(),
-                        }));
-                    res.push(dentry);
-                    iter.next();
-                    continue;
-                }
-            }
-            // Exit
-            break;
+        if limit == 0 {
+            return Ok(Vec::new());
         }
-        Ok(res)
+        let lim = if limit < 0 {
+            None
+        } else {
+            Some(limit as usize)
+        };
+        self.kv.scan(&key::DentryPrefix(parent), lim)
     }
 
     fn set_symlink(&self, inode: Ino, path: String) -> Result<()> {
-        let symlink_key = key::symlink(inode);
-        rocksdb_timed_op!(
-            db_puts_total,
-            db_put_duration_ms,
-            db_try!(self.db.put(&symlink_key, path.into_bytes()))
-        );
-        Ok(())
+        let target = value::SymlinkTarget::new(path.into_bytes());
+        self.kv
+            .transaction(|txn| txn.put(&key::Symlink(inode), &target))
     }
 
     fn get_symlink(&self, inode: Ino) -> Result<String> {
-        let symlink_key = key::symlink(inode);
-        let path_buf = rocksdb_timed_op!(
-            db_gets_total,
-            db_get_duration_ms,
-            db_try!(self.db.get_pinned(&symlink_key))
-        )
-        .context(model_err::NotFoundSnafu {
-            kind: ModelKind::Symlink,
-            key:  String::from_utf8_lossy(&symlink_key).to_string(),
-        })
-        .context(ModelSnafu)?;
-        Ok(String::from_utf8_lossy(path_buf.as_ref()).to_string())
+        let target = self.kv.get_or_missing(&key::Symlink(inode))?;
+        Ok(String::from_utf8_lossy(&target.0).into_owned())
     }
 
     fn set_chunk_slices(&self, inode: Ino, chunk_index: ChunkIndex, slices: Slices) -> Result<()> {
-        let key = key::chunk_slices(inode, chunk_index);
-        let buf = model_try!(
-            bincode::serialize(&slices).context(model_err::CorruptionSnafu {
-                kind: ModelKind::ChunkSlices,
-                key:  String::from_utf8_lossy(&key).to_string(),
-            })
-        );
-        rocksdb_timed_op!(
-            db_puts_total,
-            db_put_duration_ms,
-            db_try!(self.db.put(&key, &buf))
-        );
-        Ok(())
+        self.kv
+            .transaction(|txn| txn.put(&key::ChunkSlices(inode, chunk_index), &slices))
     }
 
     fn set_raw_chunk_slices(
@@ -887,56 +356,30 @@ impl Backend for RocksdbBackend {
         chunk_index: ChunkIndex,
         buf: Vec<u8>,
     ) -> Result<()> {
-        let key = key::chunk_slices(inode, chunk_index);
-        rocksdb_timed_op!(
-            db_puts_total,
-            db_put_duration_ms,
-            db_try!(self.db.put(&key, &buf))
-        );
+        let raw_key = key::ChunkSlices(inode, chunk_index).encode();
+        self.kv.transaction(|txn| txn.put_raw(&raw_key, &buf))?;
         assert!(!buf.is_empty(), "slices is empty");
         Ok(())
     }
 
     fn get_raw_chunk_slices(&self, inode: Ino, chunk_index: ChunkIndex) -> Result<Option<Vec<u8>>> {
-        let key = key::chunk_slices(inode, chunk_index);
-        let buf = rocksdb_timed_op!(
-            db_gets_total,
-            db_get_duration_ms,
-            db_try!(self.db.get(&key))
-        );
-        Ok(buf)
+        let raw_key = key::ChunkSlices(inode, chunk_index).encode();
+        self.kv.get_raw(&raw_key)
     }
 
     fn get_chunk_slices(&self, inode: Ino, chunk_index: ChunkIndex) -> Result<Slices> {
-        let key = key::chunk_slices(inode, chunk_index);
-        let buf = rocksdb_timed_op!(
-            db_gets_total,
-            db_get_duration_ms,
-            db_try!(self.db.get_pinned(&key))
-        )
-        .context(model_err::NotFoundSnafu {
-            kind: ModelKind::ChunkSlices,
-            key:  String::from_utf8_lossy(&key).to_string(),
-        })
-        .context(ModelSnafu)?;
-        let slices = Slices::decode(&buf)
-            .map_err(|e| e.to_string())
-            .and_then(|slices| {
-                if slices.0.is_empty() {
-                    Err("empty slices".to_string())
-                } else {
-                    Ok(slices)
-                }
-            })
-            .map_err(|reason| model_err::Error::CorruptionString {
-                kind: ModelKind::ChunkSlices,
-                key: String::from_utf8_lossy(&key).to_string(),
-                reason,
-            })
-            .context(ModelSnafu)?;
-        debug!("get_chunk_slices: key: {:?}", String::from_utf8_lossy(&key));
+        let slices: Slices = self
+            .kv
+            .get_or_missing(&key::ChunkSlices(inode, chunk_index))?;
+        if slices.0.is_empty() {
+            return Err(ModelSnafu.into_error(model_err::Error::Corrupt {
+                key:    format!("chunk_slices(inode={}, chunk={chunk_index})", inode.0),
+                reason: "empty slices".to_string(),
+            }));
+        }
+        debug!("get_chunk_slices: inode={inode} chunk_index={chunk_index}");
         for slice in &slices.0 {
-            debug!("get_chunk_slices: slice: {:?}", slice);
+            debug!("get_chunk_slices: slice: {slice:?}");
         }
         Ok(slices)
     }
@@ -947,40 +390,19 @@ impl Backend for RocksdbBackend {
         chunk_index: ChunkIndex,
         slice: &Slice,
     ) -> Result<SliceCommitResult> {
-        let mut write_options = rocksdb::WriteOptions::default();
-        write_options.set_sync(true);
-        let txn = self.db.transaction_opt(
-            &write_options,
-            &rocksdb::OptimisticTransactionOptions::default(),
-        );
-        let result = stage_slice_commit(&txn, inode, chunk_index, slice)?;
-        rocksdb_timed_op!(
-            db_transactions_total,
-            db_transaction_duration_ms,
-            db_try!(txn.commit())
-        );
-        Ok(result)
+        // A committed slice must survive a crash the moment it is acknowledged,
+        // so commit durably (fsync), matching the previous `set_sync(true)`.
+        self.kv
+            .transaction_durable(|txn| stage_slice_commit(txn, inode, chunk_index, slice))
     }
 
     fn set_dir_stat(&self, inode: Ino, dir_stat: DirStat) -> Result<()> {
-        let key = key::dir_stat(inode);
-        let buf = model_try!(
-            bincode::serialize(&dir_stat).context(model_err::CorruptionSnafu {
-                kind: ModelKind::DirStat,
-                key:  String::from_utf8_lossy(&key).to_string(),
-            })
-        );
-        rocksdb_timed_op!(
-            db_puts_total,
-            db_put_duration_ms,
-            db_try!(self.db.put(&key, &buf))
-        );
-        Ok(())
+        self.kv
+            .transaction(|txn| txn.put(&key::DirStatKey(inode), &dir_stat))
     }
 
     fn get_dir_stat(&self, inode: Ino) -> Result<DirStat> {
-        let key = key::dir_stat(inode);
-        Ok(deserialize_db!(self.db, key, DirStat, ModelKind::DirStat))
+        self.kv.get_or_missing(&key::DirStatKey(inode))
     }
 
     /// Create a new file system node - POSIX mknod(2) semantics implementation
@@ -1012,121 +434,112 @@ impl Backend for RocksdbBackend {
         &self,
         ctx: Arc<FuseContext>,
         new_inode: Ino,
-        mut new_inode_attr: InodeAttr,
+        new_inode_attr: InodeAttr,
         parent: Ino,
         name: &str,
         typ: FileType,
         path: String,
     ) -> Result<(Ino, InodeAttr)> {
-        let txn = self.db.transaction();
-        debug!("get attr {} from backend", parent);
-        let mut parent_attr = do_get_attr(&txn, parent)?;
-        ensure!(
-            parent_attr.is_dir(),
-            LibcSnafu {
-                errno: libc::ENOTDIR,
-            }
-        );
-        // check if the parent have the permission
-        ctx.check_access(&parent_attr, kiseki_common::MODE_MASK_W)?;
-        ensure!(
-            !kiseki_types::attr::Flags::from_bits_truncate(parent_attr.flags as u8)
-                .contains(kiseki_types::attr::Flags::IMMUTABLE),
-            LibcSnafu { errno: libc::EPERM }
-        );
+        self.kv.transaction(|txn| {
+            let mut new_inode_attr = new_inode_attr.clone();
+            debug!("get attr {} from backend", parent);
+            let mut parent_attr = txn.get_for_update_or_missing(&key::Attr(parent))?;
+            ensure!(
+                parent_attr.is_dir(),
+                LibcSnafu {
+                    errno: libc::ENOTDIR,
+                }
+            );
+            // check if the parent have the permission
+            ctx.check_access(&parent_attr, kiseki_common::MODE_MASK_W)?;
+            ensure!(
+                !kiseki_types::attr::Flags::from_bits_truncate(parent_attr.flags as u8)
+                    .contains(kiseki_types::attr::Flags::IMMUTABLE),
+                LibcSnafu { errno: libc::EPERM }
+            );
 
-        // check if the entry already exists
-        if let Ok(_found_entry) = do_get_dentry(&txn, parent, name) {
-            return LibcSnafu {
-                errno: libc::EEXIST,
+            // check if the entry already exists
+            if txn.get(&key::Dentry(parent, name))?.is_some() {
+                return LibcSnafu {
+                    errno: libc::EEXIST,
+                }
+                .fail();
             }
-            .fail();
-        }
 
-        // check if we need to update the parent
-        let mut update_parent_attr = false;
-        if typ == FileType::Directory {
-            parent_attr.set_nlink(parent_attr.nlink + 1);
+            // check if we need to update the parent
+            let mut update_parent_attr = false;
+            if typ == FileType::Directory {
+                parent_attr.set_nlink(parent_attr.nlink + 1);
+
+                let now = SystemTime::now();
+                parent_attr.mtime = now;
+                parent_attr.ctime = now;
+                update_parent_attr = true;
+            };
 
             let now = SystemTime::now();
-            parent_attr.mtime = now;
-            parent_attr.ctime = now;
-            update_parent_attr = true;
-        };
+            new_inode_attr.set_atime(now);
+            new_inode_attr.set_mtime(now);
+            new_inode_attr.set_ctime(now);
 
-        let now = SystemTime::now();
-        new_inode_attr.set_atime(now);
-        new_inode_attr.set_mtime(now);
-        new_inode_attr.set_ctime(now);
-
-        #[cfg(target_os = "macos")]
-        {
-            new_inode_attr.set_gid(parent_attr.gid);
-        }
-
-        // TODO: review the logic here
-        #[cfg(target_os = "linux")]
-        {
-            // if the parent directory has the set group ID (SGID) bit set in its
-            // mode. If so, it sets the group ID of the new node to
-            // the group ID of the parent directory.
-            if parent_attr.mode & constants::S_ISGID != 0 {
+            #[cfg(target_os = "macos")]
+            {
                 new_inode_attr.set_gid(parent_attr.gid);
-                // If the type of the node being created is a directory, it sets the SGID bit
-                // in the mode of the new node. This ensures that newly created directories
-                // inherit the group ID of their parent directory.
-                if typ == FileType::Directory {
-                    new_inode_attr.mode |= constants::S_ISGID;
-                } else if new_inode_attr.mode & constants::MODE_MASK_SETGID_EXEC
-                    == constants::MODE_MASK_SETGID_EXEC
-                    && ctx.uid != 0
-                    && !ctx.gid_list.contains(&parent_attr.gid)
-                {
-                    // If the mode of the new node has both the set group ID bit and the set
-                    // group execute bit, and if the user ID is not 0 (i.e., the user is not root),
-                    // it further checks if the user belongs to the group of the parent directory.
-                    // If not, it removes the SGID bit from the mode of the new node.
-                    new_inode_attr.mode &= !constants::MODE_MASK_SETGID_EXEC;
+            }
+
+            // TODO: review the logic here
+            #[cfg(target_os = "linux")]
+            {
+                // if the parent directory has the set group ID (SGID) bit set in its
+                // mode. If so, it sets the group ID of the new node to
+                // the group ID of the parent directory.
+                if parent_attr.mode & constants::S_ISGID != 0 {
+                    new_inode_attr.set_gid(parent_attr.gid);
+                    // If the type of the node being created is a directory, it sets the SGID bit
+                    // in the mode of the new node. This ensures that newly created directories
+                    // inherit the group ID of their parent directory.
+                    if typ == FileType::Directory {
+                        new_inode_attr.mode |= constants::S_ISGID;
+                    } else if new_inode_attr.mode & constants::MODE_MASK_SETGID_EXEC
+                        == constants::MODE_MASK_SETGID_EXEC
+                        && ctx.uid != 0
+                        && !ctx.gid_list.contains(&parent_attr.gid)
+                    {
+                        // If the mode of the new node has both the set group ID bit and the set
+                        // group execute bit, and if the user ID is not 0 (i.e., the user is not
+                        // root), it further checks if the user belongs to the group of the parent
+                        // directory. If not, it removes the SGID bit from the mode of the new node.
+                        new_inode_attr.mode &= !constants::MODE_MASK_SETGID_EXEC;
+                    }
                 }
             }
-        }
 
-        let mut batch = txn.get_writebatch();
-        // insert entry
-        set_dentry_in_write_batch(&mut batch, parent, name, new_inode, typ)?;
-        // insert attr
-        set_attr_in_write_batch(&mut batch, new_inode, &new_inode_attr)?;
+            // insert entry
+            txn.put(
+                &key::Dentry(parent, name),
+                &DEntry {
+                    parent,
+                    name: name.to_string(),
+                    inode: new_inode,
+                    typ,
+                },
+            )?;
+            // insert attr
+            txn.put(&key::Attr(new_inode), &new_inode_attr)?;
 
-        if update_parent_attr {
-            // update parent attr
-            set_attr_in_write_batch(&mut batch, parent, &parent_attr)?;
-        }
-        if typ == FileType::Symlink {
-            let symlink_key = key::symlink(new_inode);
-            batch.put(&symlink_key, path.into_bytes());
-            rocksdb_counter!(db_puts_total);
-        }
+            if update_parent_attr {
+                // update parent attr
+                txn.put(&key::Attr(parent), &parent_attr)?;
+            }
+            if typ == FileType::Symlink {
+                txn.put(
+                    &key::Symlink(new_inode),
+                    &value::SymlinkTarget::new(path.clone().into_bytes()),
+                )?;
+            }
 
-        // Record RocksDB write and transaction with metrics
-        rocksdb_timed_op!(
-            db_batch_writes_total,
-            db_write_duration_ms,
-            self.db.write(batch).inspect_err(|_e| {
-                rocksdb_error!(crate::metrics::labels::ERROR_WRITE_BATCH);
-            })
-        )
-        .context(RocksdbSnafu)?;
-
-        rocksdb_timed_op!(
-            db_transactions_total,
-            db_transaction_duration_ms,
-            txn.commit().inspect_err(|_e| {
-                rocksdb_error!(crate::metrics::labels::ERROR_TRANSACTION_COMMIT);
-            })
-        )
-        .context(RocksdbSnafu)?;
-
-        Ok((new_inode, new_inode_attr))
+            Ok((new_inode, new_inode_attr))
+        })
     }
 
     /// Remove a directory - POSIX rmdir(2) semantics implementation
@@ -1163,112 +576,89 @@ impl Backend for RocksdbBackend {
         name: &str,
         skip_dir_mtime: Duration,
     ) -> Result<(DEntry, InodeAttr)> {
-        let txn = self.db.transaction();
-        let entry_info = do_get_dentry(&txn, parent, name)?;
-        ensure!(
-            entry_info.typ == FileType::Directory,
-            LibcSnafu {
-                errno: libc::ENOTDIR,
-            }
-        );
-        // get parent and child's attr
-        let mut parent_attr = do_get_attr(&txn, parent)?;
-        ensure!(
-            // parent must be dir.
-            parent_attr.is_dir(),
-            LibcSnafu {
-                errno: libc::ENOTDIR,
-            }
-        );
-        let child_attr = do_get_attr(&txn, entry_info.inode)?;
-        ensure!(
-            // child must be dir. check again in case of we found that the entry info tells
-            // the different story.
-            child_attr.is_dir(),
-            LibcSnafu {
-                errno: libc::ENOTDIR,
-            }
-        );
-
-        ctx.check_access(
-            &parent_attr,
-            kiseki_common::MODE_MASK_W | kiseki_common::MODE_MASK_X,
-        )?;
-        let parent_flag = kiseki_types::attr::Flags::from_bits_truncate(parent_attr.flags as u8);
-        ensure!(
-            !parent_flag.contains(kiseki_types::attr::Flags::APPEND)
-                && !parent_flag.contains(kiseki_types::attr::Flags::IMMUTABLE),
-            LibcSnafu { errno: libc::EPERM }
-        );
-        ensure!(
-            !do_check_exist_children(&txn, entry_info.inode)?,
-            LibcSnafu {
-                errno: libc::ENOTEMPTY,
-            }
-        );
-        // POSIX sticky bit check for rmdir operation (POSIX.1-2008 Section 4.5.4)
-        // When sticky bit is SET on parent directory, only directory owner,
-        // file owner, or root can delete the directory entry
-        if ctx.uid != 0
-            && parent_attr.mode & constants::S_ISVTX != 0
-            && ctx.uid != parent_attr.uid
-            && ctx.uid != child_attr.uid
-        {
-            return LibcSnafu {
-                errno: libc::EACCES,
-            }
-            .fail();
-        }
-        parent_attr.nlink -= 1;
-        let now = SystemTime::now();
-
-        let need_update_parent_attr = if now
-            .duration_since(parent_attr.mtime)
-            .expect("found mtime in the future")
-            >= skip_dir_mtime
-        {
-            parent_attr.mtime = now;
-            parent_attr.ctime = now;
-            true
-        } else {
-            false
-        };
-
-        let mut batch = txn.get_writebatch();
-        // delete entry
-        batch.delete(key::dentry(parent, name));
-        rocksdb_delete!();
-        // delete inode attr
-        batch.delete(key::attr(entry_info.inode));
-        rocksdb_delete!();
-        if need_update_parent_attr {
-            let parent_attr_key = key::attr(parent);
-            // update parent attr
-            let serialized = model_try!(bincode::serialize(&parent_attr).context(
-                model_err::CorruptionSnafu {
-                    kind: ModelKind::Attr,
-                    key:  String::from_utf8_lossy(&parent_attr_key).to_string(),
+        self.kv.transaction(|txn| {
+            let entry_info = txn.get_or_missing(&key::Dentry(parent, name))?;
+            ensure!(
+                entry_info.typ == FileType::Directory,
+                LibcSnafu {
+                    errno: libc::ENOTDIR,
                 }
-            ));
-            batch.put(&parent_attr_key, serialized);
-            rocksdb_counter!(db_puts_total);
-        }
+            );
+            // get parent and child's attr
+            let mut parent_attr = txn.get_for_update_or_missing(&key::Attr(parent))?;
+            ensure!(
+                // parent must be dir.
+                parent_attr.is_dir(),
+                LibcSnafu {
+                    errno: libc::ENOTDIR,
+                }
+            );
+            let child_attr = txn.get_or_missing(&key::Attr(entry_info.inode))?;
+            ensure!(
+                // child must be dir. check again in case of we found that the entry info tells
+                // the different story.
+                child_attr.is_dir(),
+                LibcSnafu {
+                    errno: libc::ENOTDIR,
+                }
+            );
 
-        // Record RocksDB operations with metrics
-        rocksdb_timed_op!(
-            db_batch_writes_total,
-            db_write_duration_ms,
-            self.db.write(batch)
-        )
-        .context(RocksdbSnafu)?;
-        rocksdb_timed_op!(
-            db_transactions_total,
-            db_transaction_duration_ms,
-            txn.commit()
-        )
-        .context(RocksdbSnafu)?;
+            ctx.check_access(
+                &parent_attr,
+                kiseki_common::MODE_MASK_W | kiseki_common::MODE_MASK_X,
+            )?;
+            let parent_flag =
+                kiseki_types::attr::Flags::from_bits_truncate(parent_attr.flags as u8);
+            ensure!(
+                !parent_flag.contains(kiseki_types::attr::Flags::APPEND)
+                    && !parent_flag.contains(kiseki_types::attr::Flags::IMMUTABLE),
+                LibcSnafu { errno: libc::EPERM }
+            );
+            ensure!(
+                !do_check_exist_children(txn, entry_info.inode)?,
+                LibcSnafu {
+                    errno: libc::ENOTEMPTY,
+                }
+            );
+            // POSIX sticky bit check for rmdir operation (POSIX.1-2008 Section 4.5.4)
+            // When sticky bit is SET on parent directory, only directory owner,
+            // file owner, or root can delete the directory entry
+            if ctx.uid != 0
+                && parent_attr.mode & constants::S_ISVTX != 0
+                && ctx.uid != parent_attr.uid
+                && ctx.uid != child_attr.uid
+            {
+                return LibcSnafu {
+                    errno: libc::EACCES,
+                }
+                .fail();
+            }
+            parent_attr.nlink -= 1;
+            let now = SystemTime::now();
 
-        Ok((entry_info, child_attr))
+            let need_update_parent_attr = if now
+                .duration_since(parent_attr.mtime)
+                .expect("found mtime in the future")
+                >= skip_dir_mtime
+            {
+                parent_attr.mtime = now;
+                parent_attr.ctime = now;
+                true
+            } else {
+                false
+            };
+
+            // delete entry
+            txn.delete(&key::Dentry(parent, name))?;
+            // delete inode attr
+            txn.delete(&key::Attr(entry_info.inode))?;
+            if need_update_parent_attr {
+                // update parent attr
+                txn.put(&key::Attr(parent), &parent_attr)?;
+            }
+
+            Ok((entry_info, child_attr))
+        })
     }
 
     /// Truncate a regular file to specified length - POSIX truncate(2)
@@ -1303,48 +693,44 @@ impl Backend for RocksdbBackend {
         length: u64,
         skip_perm_check: bool,
     ) -> Result<InodeAttr> {
-        let txn = self.db.transaction();
-        let mut old_attr = do_get_attr(&txn, inode)?;
-        ensure!(
-            matches!(old_attr.kind, FileType::RegularFile),
-            LibcSnafu { errno: libc::EPERM }
-        );
-        let flags = kiseki_types::attr::Flags::from_bits_truncate(old_attr.flags as u8);
-        if flags.contains(kiseki_types::attr::Flags::IMMUTABLE)
-            || flags.contains(kiseki_types::attr::Flags::APPEND)
-        {
-            return LibcSnafu { errno: libc::EPERM }.fail();
-        }
-        if !skip_perm_check {
-            ctx.check_access(&old_attr, kiseki_common::MODE_MASK_W)?;
-        }
-        assert_ne!(length, old_attr.length, "length is the same");
-        ensure!(
-            usize::try_from(length).is_ok() && usize::try_from(old_attr.length).is_ok(),
-            LibcSnafu { errno: libc::EFBIG }
-        );
-        let old_length = old_attr.length as usize;
-        let new_length = length as usize;
-        if new_length > old_length {
-            let mut position = old_length;
-            while position < new_length {
-                let chunk_index = position / CHUNK_SIZE;
-                let chunk_position = position % CHUNK_SIZE;
-                let hole_length = (CHUNK_SIZE - chunk_position).min(new_length - position);
-                let hole = Slice::new_owned(chunk_position, EMPTY_SLICE_ID, hole_length);
-                stage_chunk_slice(&txn, inode, chunk_index, &hole)?;
-                position += hole_length;
+        self.kv.transaction(|txn| {
+            let mut old_attr = txn.get_for_update_or_missing(&key::Attr(inode))?;
+            ensure!(
+                matches!(old_attr.kind, FileType::RegularFile),
+                LibcSnafu { errno: libc::EPERM }
+            );
+            let flags = kiseki_types::attr::Flags::from_bits_truncate(old_attr.flags as u8);
+            if flags.contains(kiseki_types::attr::Flags::IMMUTABLE)
+                || flags.contains(kiseki_types::attr::Flags::APPEND)
+            {
+                return LibcSnafu { errno: libc::EPERM }.fail();
             }
-        }
-        old_attr.update_length(length);
+            if !skip_perm_check {
+                ctx.check_access(&old_attr, kiseki_common::MODE_MASK_W)?;
+            }
+            assert_ne!(length, old_attr.length, "length is the same");
+            ensure!(
+                usize::try_from(length).is_ok() && usize::try_from(old_attr.length).is_ok(),
+                LibcSnafu { errno: libc::EFBIG }
+            );
+            let old_length = old_attr.length as usize;
+            let new_length = length as usize;
+            if new_length > old_length {
+                let mut position = old_length;
+                while position < new_length {
+                    let chunk_index = position / CHUNK_SIZE;
+                    let chunk_position = position % CHUNK_SIZE;
+                    let hole_length = (CHUNK_SIZE - chunk_position).min(new_length - position);
+                    let hole = Slice::new_owned(chunk_position, EMPTY_SLICE_ID, hole_length);
+                    stage_chunk_slice(txn, inode, chunk_index, &hole)?;
+                    position += hole_length;
+                }
+            }
+            old_attr.update_length(length);
 
-        txn_put_attr(&txn, inode, &old_attr)?;
-        rocksdb_timed_op!(
-            db_transactions_total,
-            db_transaction_duration_ms,
-            db_try!(txn.commit())
-        );
-        Ok(old_attr.clone())
+            txn.put(&key::Attr(inode), &old_attr)?;
+            Ok(old_attr)
+        })
     }
 
     /// Create a hard link to existing file - POSIX link(2) semantics
@@ -1387,73 +773,66 @@ impl Backend for RocksdbBackend {
         new_parent: Ino,
         new_name: &str,
     ) -> Result<InodeAttr> {
-        let txn = self.db.transaction();
+        let skip = self.skip_dir_mtime;
+        self.kv.transaction(|txn| {
+            // get parent and child's attr
+            let mut parent_attr = txn.get_for_update_or_missing(&key::Attr(new_parent))?;
+            ensure!(
+                // parent must be dir.
+                parent_attr.is_dir(),
+                LibcSnafu {
+                    errno: libc::ENOTDIR,
+                }
+            );
+            ctx.check_access(&parent_attr, kiseki_common::MODE_MASK_W)?;
+            ensure!(
+                !parent_attr.is_immutable(),
+                LibcSnafu { errno: libc::EPERM }
+            );
 
-        // get parent and child's attr
-        let mut parent_attr = do_get_attr(&txn, new_parent)?;
-        ensure!(
-            // parent must be dir.
-            parent_attr.is_dir(),
-            LibcSnafu {
-                errno: libc::ENOTDIR,
+            let mut child_attr = txn.get_for_update_or_missing(&key::Attr(inode))?;
+            ensure!(!child_attr.is_dir(), LibcSnafu { errno: libc::EPERM });
+            ensure!(child_attr.is_normal(), LibcSnafu { errno: libc::EPERM });
+            ensure!(
+                // the target name must be empty
+                txn.get(&key::Dentry(new_parent, new_name))?.is_none(),
+                LibcSnafu {
+                    errno: libc::EEXIST,
+                }
+            );
+            // check if we need to update the parent
+            let now = SystemTime::now();
+            let need_update_parent_attr = parent_attr.update_modification_time_if(now, skip);
+            let old_parent = child_attr.parent;
+            child_attr.ctime = now;
+            child_attr.nlink += 1;
+            child_attr.parent = ZERO_INO;
+
+            // 1. create an entry that points to the original inode.
+            txn.put(
+                &key::Dentry(new_parent, new_name),
+                &DEntry {
+                    parent: new_parent,
+                    name: new_name.to_string(),
+                    inode,
+                    typ: child_attr.kind,
+                },
+            )?;
+            if need_update_parent_attr {
+                // 2. update parent attr
+                txn.put(&key::Attr(new_parent), &parent_attr)?;
             }
-        );
-        ctx.check_access(&parent_attr, kiseki_common::MODE_MASK_W)?;
-        ensure!(
-            !parent_attr.is_immutable(),
-            LibcSnafu { errno: libc::EPERM }
-        );
-
-        let mut child_attr = do_get_attr(&txn, inode)?;
-        ensure!(!child_attr.is_dir(), LibcSnafu { errno: libc::EPERM });
-        ensure!(child_attr.is_normal(), LibcSnafu { errno: libc::EPERM });
-        ensure!(
-            // the target inode must be empty
-            do_get_dentry(&txn, new_parent, new_name).is_err(),
-            LibcSnafu {
-                errno: libc::EEXIST,
+            // 3. update child attr
+            txn.put(&key::Attr(inode), &child_attr)?;
+            if !child_attr.parent.is_zero() {
+                let cnt = get_hard_link_count(txn, inode, old_parent)?;
+                txn.put(&key::HardLink(inode, old_parent), &(cnt + 1))?;
             }
-        );
-        // check if we need to update the parent
-        let now = SystemTime::now();
-        let need_update_parent_attr =
-            parent_attr.update_modification_time_if(now, self.skip_dir_mtime);
-        let old_parent = child_attr.parent;
-        child_attr.ctime = now;
-        child_attr.nlink += 1;
-        child_attr.parent = ZERO_INO;
+            let cnt = get_hard_link_count(txn, inode, new_parent)?;
+            txn.put(&key::HardLink(inode, new_parent), &(cnt + 1))?;
 
-        let mut batch = txn.get_writebatch();
-        // 1. create an entry that points to the original inode.
-        set_dentry_in_write_batch(&mut batch, new_parent, new_name, inode, child_attr.kind)?;
-        if need_update_parent_attr {
-            // 2. update parent attr
-            set_attr_in_write_batch(&mut batch, new_parent, &parent_attr)?;
-        }
-        // 3. update child attr
-        set_attr_in_write_batch(&mut batch, inode, &child_attr)?;
-        if !child_attr.parent.is_zero() {
-            let cnt = do_get_hard_link_count(&txn, inode, old_parent)?;
-            set_hard_link_count_in_write_batch(&mut batch, inode, old_parent, cnt + 1)?;
-        }
-        let cnt = do_get_hard_link_count(&txn, inode, new_parent)?;
-        set_hard_link_count_in_write_batch(&mut batch, inode, new_parent, cnt + 1)?;
-
-        // Record RocksDB operations with metrics
-        rocksdb_timed_op!(
-            db_batch_writes_total,
-            db_write_duration_ms,
-            self.db.write(batch)
-        )
-        .context(RocksdbSnafu)?;
-        rocksdb_timed_op!(
-            db_transactions_total,
-            db_transaction_duration_ms,
-            txn.commit()
-        )
-        .context(RocksdbSnafu)?;
-
-        Ok(child_attr)
+            Ok(child_attr)
+        })
     }
 
     /// Remove a file (unlink) - POSIX unlink(2) semantics implementation
@@ -1494,181 +873,135 @@ impl Backend for RocksdbBackend {
         session_id: u64,
         open_files_ref: OpenFilesRef,
     ) -> Result<UnlinkResult> {
-        let txn = self.db.transaction();
-
-        let entry = do_get_dentry(&txn, parent, &name)?;
-        ensure!(
-            !matches!(entry.typ, FileType::Directory),
-            LibcSnafu { errno: libc::EPERM }
-        );
-        // get parent and child's attr
-        let mut parent_attr = do_get_attr(&txn, parent)?;
-        ensure!(
-            // parent must be dir.
-            parent_attr.is_dir(),
-            LibcSnafu {
-                errno: libc::ENOTDIR,
-            }
-        );
-        ctx.check_access(
-            &parent_attr,
-            kiseki_common::MODE_MASK_W | kiseki_common::MODE_MASK_X,
-        )?;
-        ensure!(parent_attr.is_normal(), LibcSnafu { errno: libc::EPERM });
-
-        let now = SystemTime::now();
+        // Whether the target is currently open is a runtime property (not stored
+        // in the KV layer), so it must be sampled outside the synchronous,
+        // possibly-retried transaction. It is only consumed below once the inode
+        // reaches nlink == 0, matching the previous semantics.
+        let entry0 = self.kv.get_or_missing(&key::Dentry(parent, &name))?;
         let mut opened = false;
-        let mut attr_place_holder = InodeAttr::empty();
-        // the target exist
-        if let Ok(mut attr) = do_get_attr(&txn, entry.inode) {
-            // POSIX sticky bit check for unlink operation (POSIX.1-2008 Section 4.5.4)
-            // When sticky bit is SET on parent directory, only directory owner,
-            // file owner, or root can delete the file
-            if ctx.uid != 0
-                && parent_attr.mode & constants::S_ISVTX != 0
-                && ctx.uid != parent_attr.uid
-                && ctx.uid != attr.uid
-            {
-                return LibcSnafu {
-                    errno: libc::EACCES,
-                }
-                .fail();
-            }
-            ensure!(attr.is_normal(), LibcSnafu { errno: libc::EPERM });
-            attr.ctime = now;
-            attr.nlink -= 1;
-            if attr.is_file()
-                && attr.nlink == 0
-                && let Some(of) = open_files_ref.load(&entry.inode).await
-            {
-                opened = of.is_opened().await;
-            };
-            attr_place_holder = attr;
+        if !matches!(entry0.typ, FileType::Directory)
+            && let Some(of) = open_files_ref.load(&entry0.inode).await
+        {
+            opened = of.is_opened().await;
         }
 
-        let mut batch = txn.get_writebatch();
-        if parent_attr.update_modification_time_if(now, self.skip_dir_mtime) {
-            set_attr_in_write_batch(&mut batch, parent, &parent_attr)?;
-        }
-        // delete the entry
-        batch.delete(key::dentry(parent, &name));
-        rocksdb_delete!();
-        let mut free_inode_cnt = 0;
-        let mut free_space_size = 0;
-
-        if attr_place_holder.nlink > 0 {
-            set_attr_in_write_batch(&mut batch, entry.inode, &attr_place_holder)?;
-            if attr_place_holder.parent.is_zero() {
-                let cnt = do_get_hard_link_count(&txn, entry.inode, parent)?;
-                if cnt > 0 {
-                    set_hard_link_count_in_write_batch(&mut batch, entry.inode, parent, cnt - 1)?;
+        let skip = self.skip_dir_mtime;
+        self.kv.transaction(|txn| {
+            let entry = txn.get_or_missing(&key::Dentry(parent, &name))?;
+            ensure!(
+                !matches!(entry.typ, FileType::Directory),
+                LibcSnafu { errno: libc::EPERM }
+            );
+            // get parent and child's attr
+            let mut parent_attr = txn.get_for_update_or_missing(&key::Attr(parent))?;
+            ensure!(
+                // parent must be dir.
+                parent_attr.is_dir(),
+                LibcSnafu {
+                    errno: libc::ENOTDIR,
                 }
+            );
+            ctx.check_access(
+                &parent_attr,
+                kiseki_common::MODE_MASK_W | kiseki_common::MODE_MASK_X,
+            )?;
+            ensure!(parent_attr.is_normal(), LibcSnafu { errno: libc::EPERM });
+
+            let now = SystemTime::now();
+            let mut attr_place_holder = InodeAttr::empty();
+            // the target exist
+            if let Ok(mut attr) = txn.get_for_update_or_missing(&key::Attr(entry.inode)) {
+                // POSIX sticky bit check for unlink operation (POSIX.1-2008 Section 4.5.4)
+                // When sticky bit is SET on parent directory, only directory owner,
+                // file owner, or root can delete the file
+                if ctx.uid != 0
+                    && parent_attr.mode & constants::S_ISVTX != 0
+                    && ctx.uid != parent_attr.uid
+                    && ctx.uid != attr.uid
+                {
+                    return LibcSnafu {
+                        errno: libc::EACCES,
+                    }
+                    .fail();
+                }
+                ensure!(attr.is_normal(), LibcSnafu { errno: libc::EPERM });
+                attr.ctime = now;
+                attr.nlink -= 1;
+                attr_place_holder = attr;
             }
-        } else {
-            if matches!(attr_place_holder.kind, FileType::RegularFile) {
-                if opened {
-                    // update the inode attr
-                    set_attr_in_write_batch(&mut batch, entry.inode, &attr_place_holder)?;
-                    set_sustained_in_write_batch(&mut batch, session_id, entry.inode, 1)?;
-                } else {
-                    // make a notification that we need to delete the chunk after a while.
-                    set_delete_chunk_after_in_write_batch(&mut batch, entry.inode)?;
-                    // delete inode attr
-                    batch.delete(key::attr(entry.inode));
-                    rocksdb_delete!();
-                    free_inode_cnt += 1;
-                    free_space_size += attr_place_holder.length;
+
+            if parent_attr.update_modification_time_if(now, skip) {
+                txn.put(&key::Attr(parent), &parent_attr)?;
+            }
+            // delete the entry
+            txn.delete(&key::Dentry(parent, &name))?;
+            let mut free_inode_cnt = 0;
+            let mut free_space_size = 0;
+
+            if attr_place_holder.nlink > 0 {
+                txn.put(&key::Attr(entry.inode), &attr_place_holder)?;
+                if attr_place_holder.parent.is_zero() {
+                    let cnt = get_hard_link_count(txn, entry.inode, parent)?;
+                    if cnt > 0 {
+                        txn.put(&key::HardLink(entry.inode, parent), &(cnt - 1))?;
+                    }
                 }
             } else {
-                if matches!(attr_place_holder.kind, FileType::Symlink) {
-                    batch.delete(key::symlink(entry.inode));
-                    rocksdb_delete!();
+                if matches!(attr_place_holder.kind, FileType::RegularFile) {
+                    if opened {
+                        // update the inode attr
+                        txn.put(&key::Attr(entry.inode), &attr_place_holder)?;
+                        txn.put(&key::Sustained(session_id, entry.inode), &1u64)?;
+                    } else {
+                        // make a notification that we need to delete the chunk after a while.
+                        txn.put(&key::DeleteChunk(entry.inode), &now_secs())?;
+                        // delete inode attr
+                        txn.delete(&key::Attr(entry.inode))?;
+                        free_inode_cnt += 1;
+                        free_space_size += attr_place_holder.length;
+                    }
+                } else {
+                    if matches!(attr_place_holder.kind, FileType::Symlink) {
+                        txn.delete(&key::Symlink(entry.inode))?;
+                    }
+                    txn.delete(&key::Attr(entry.inode))?;
+                    free_inode_cnt += 1;
+                    free_space_size += constants::DEFAULT_FILE_SIZE;
                 }
-                batch.delete(key::attr(entry.inode));
-                rocksdb_delete!();
-                free_inode_cnt += 1;
-                free_space_size += constants::DEFAULT_FILE_SIZE;
+                // delete xattr
+                txn.delete_prefix_raw(&crate::backend::key::xattr_prefix(entry.inode))?;
+                if attr_place_holder.parent.is_zero() {
+                    // delete hardlinks
+                    txn.delete_prefix(&key::HardLinkPrefix(entry.inode))?;
+                }
             }
-            // delete xattr
-            delete_prefix_in_txn_write_batch(&txn, &mut batch, &key::xattr_prefix(entry.inode));
-            if attr_place_holder.parent.is_zero() {
-                // delete hardlinks
-                delete_prefix_in_txn_write_batch(
-                    &txn,
-                    &mut batch,
-                    &key::parent_prefix(entry.inode),
-                );
+
+            let mut r = UnlinkResult {
+                inode:       entry.inode,
+                removed:     None,
+                freed_space: free_space_size,
+                freed_inode: free_inode_cnt,
+                is_opened:   opened,
+            };
+            if attr_place_holder.nlink == 0 && attr_place_holder.is_file() {
+                r.removed = Some(attr_place_holder);
             }
-        }
-        rocksdb_timed_op!(
-            db_batch_writes_total,
-            db_write_duration_ms,
-            db_try!(self.db.write(batch))
-        );
-        let mut r = UnlinkResult {
-            inode:       entry.inode,
-            removed:     None,
-            freed_space: free_space_size,
-            freed_inode: free_inode_cnt,
-            is_opened:   opened,
-        };
-        if attr_place_holder.nlink == 0 && attr_place_holder.is_file() {
-            r.removed = Some(attr_place_holder);
-        }
 
-        // Record RocksDB transaction with metrics
-        rocksdb_timed_op!(
-            db_transactions_total,
-            db_transaction_duration_ms,
-            txn.commit()
-        )
-        .context(RocksdbSnafu)?;
-
-        Ok(r)
+            Ok(r)
+        })
     }
 
     fn do_delete_chunks(&self, inode: Ino) {
-        let txn = self.db.transaction();
-        let mut batch = txn.get_writebatch();
-        let mut ro = rocksdb::ReadOptions::default();
-
-        let prefix = key::chunk_slices_prefix(inode);
-        let prefix = prefix.as_slice();
-        ro.set_iterate_range(rocksdb::PrefixRange(prefix));
-        let mut iter = txn.raw_iterator_opt(ro);
-        iter.seek_to_first();
-        // Scan the keys in the iterator
-        while iter.valid() {
-            if let Some(k) = iter.key()
-                && k.starts_with(prefix)
-            {
-                // at present, we delete the slice directly, since we haven't implemented the
-                // borrow mechanism.
-                batch.delete(k);
-                iter.next();
-                continue;
-            }
-            break;
-        }
-        drop(iter);
-        // clear the delete notification
-        batch.delete(key::delete_chunk_after(inode));
-        rocksdb_delete!();
-
-        if let Err(e) = rocksdb_timed_op!(
-            db_batch_writes_total,
-            db_write_duration_ms,
-            self.db.write(batch)
-        ) {
-            error!("write batch failed when do_delete_chunks: {:?}", e);
-            return;
-        }
-        if let Err(e) = rocksdb_timed_op!(
-            db_transactions_total,
-            db_transaction_duration_ms,
-            txn.commit()
-        ) {
-            error!("commit failed in do_delete_chunks: {:?}", e);
+        // at present, we delete the slices directly, since we haven't
+        // implemented the borrow mechanism.
+        let result = self.kv.transaction(|txn| {
+            txn.delete_prefix(&key::ChunkSlicesPrefix(inode))?;
+            // clear the delete notification
+            txn.delete(&key::DeleteChunk(inode))?;
+            Ok(())
+        });
+        if let Err(e) = result {
+            error!("failed to do_delete_chunks for {inode}: {e:?}");
         }
     }
 
@@ -1719,133 +1052,73 @@ impl Backend for RocksdbBackend {
         flags: RenameFlags,
         open_files_ref: OpenFilesRef,
     ) -> Result<RenameResult> {
-        let txn = self.db.transaction();
-        let old_entry = do_get_dentry(&txn, old_parent, old_name)?;
-        let mut rename_result = RenameResult {
-            need_delete: None,
-            freed_inode: 0,
-            freed_space: 0,
-        };
-        if old_parent == new_parent && old_name == new_name {
-            return Ok(rename_result);
+        // Sample whether an existing destination regular file is currently open.
+        // Like `do_unlink`, this runtime property must be resolved before the
+        // synchronous transaction; it is only consumed in the replace path when
+        // the destination reaches nlink == 0.
+        let mut opened = false;
+        if let Ok(dst_entry) = self.kv.get_or_missing(&key::Dentry(new_parent, new_name))
+            && matches!(dst_entry.typ, FileType::RegularFile)
+            && let Some(of) = open_files_ref.load(&dst_entry.inode).await
+        {
+            opened = of.is_opened().await;
         }
 
-        let mut old_parent_attr = do_get_attr(&txn, old_parent)?;
-        {
-            // check access permission
-            ensure!(
-                old_parent_attr.is_dir(),
-                LibcSnafu {
-                    errno: libc::ENOTDIR,
-                }
-            );
-            ctx.check_access(
-                &old_parent_attr,
-                kiseki_common::MODE_MASK_W | kiseki_common::MODE_MASK_X,
-            )?;
-        }
-
-        let mut new_parent_attr = do_get_attr(&txn, new_parent)?;
-        {
-            ensure!(
-                new_parent_attr.is_dir(),
-                LibcSnafu {
-                    errno: libc::ENOTDIR,
-                }
-            );
-            ctx.check_access(
-                &new_parent_attr,
-                kiseki_common::MODE_MASK_W | kiseki_common::MODE_MASK_X,
-            )?;
-            ensure!(
-                old_entry.inode != new_parent && old_entry.inode != new_parent_attr.parent,
-                LibcSnafu { errno: libc::EPERM }
-            );
-        }
-
-        let mut old_inode_attr = do_get_attr(&txn, old_entry.inode)?;
-        {
-            ensure!(old_inode_attr.is_normal(), LibcSnafu { errno: libc::EPERM });
-            // POSIX sticky bit check for rename source (POSIX.1-2008 Section 4.5.4)
-            // When sticky bit is SET on source directory, additional permission check
-            if old_parent != new_parent
-                && old_parent_attr.mode & constants::S_ISVTX != 0
-                && ctx.uid != 0
-                && ctx.uid != old_inode_attr.uid
-                && (ctx.uid != old_parent_attr.uid || old_inode_attr.is_dir())
-            {
-                return LibcSnafu {
-                    errno: libc::EACCES,
-                }
-                .fail();
+        let skip = self.skip_dir_mtime;
+        self.kv.transaction(|txn| {
+            let old_entry = txn.get_or_missing(&key::Dentry(old_parent, old_name))?;
+            let mut rename_result = RenameResult {
+                need_delete: None,
+                freed_inode: 0,
+                freed_space: 0,
+            };
+            if old_parent == new_parent && old_name == new_name {
+                return Ok(rename_result);
             }
 
-            // POSIX sticky bit check for rename operation (POSIX.1-2008 Section 4.5.4)
-            // Additional sticky bit permission check for rename
-            if ctx.uid != 0
-                && (old_parent_attr.mode & constants::S_ISVTX) != 0
-                && ctx.uid != old_parent_attr.uid
-                && ctx.uid != old_inode_attr.uid
+            let mut old_parent_attr = txn.get_for_update_or_missing(&key::Attr(old_parent))?;
             {
-                return LibcSnafu {
-                    errno: libc::EACCES,
-                }
-                .fail();
-            }
-        }
-
-        let (mut update_new_parent, mut opened, mut dst_dentry_opt, mut dst_attr_opt) =
-            (false, false, None, None);
-        match do_get_dentry(&txn, new_parent, new_name) {
-            Ok(dst_entry) => {
-                // dst exists
+                // check access permission
                 ensure!(
-                    !flags.contains(RenameFlags::NOREPLACE),
+                    old_parent_attr.is_dir(),
                     LibcSnafu {
-                        errno: libc::EEXIST,
+                        errno: libc::ENOTDIR,
                     }
                 );
+                ctx.check_access(
+                    &old_parent_attr,
+                    kiseki_common::MODE_MASK_W | kiseki_common::MODE_MASK_X,
+                )?;
+            }
 
-                let mut dst_attr = do_get_attr(&txn, dst_entry.inode)?;
-                ensure!(dst_attr.is_normal(), LibcSnafu { errno: libc::EPERM });
-                dst_attr.ctime = SystemTime::now();
-
-                if matches!(flags, RenameFlags::EXCHANGE) {
-                    if old_parent != new_parent {
-                        if matches!(dst_entry.typ, FileType::Directory) {
-                            dst_attr.parent = old_parent;
-                            new_parent_attr.nlink -= 1;
-                            old_parent_attr.nlink += 1;
-                        } else if !dst_attr.parent.is_zero() {
-                            dst_attr.parent = old_parent;
-                        }
+            let mut new_parent_attr = txn.get_for_update_or_missing(&key::Attr(new_parent))?;
+            {
+                ensure!(
+                    new_parent_attr.is_dir(),
+                    LibcSnafu {
+                        errno: libc::ENOTDIR,
                     }
-                } else if matches!(dst_entry.typ, FileType::Directory) {
-                    ensure!(
-                        !do_check_exist_children(&txn, dst_entry.inode)?,
-                        LibcSnafu {
-                            errno: libc::ENOTEMPTY,
-                        }
-                    );
-                    new_parent_attr.nlink -= 1;
-                    update_new_parent = true;
-                } else {
-                    dst_attr.nlink -= 1;
-                    if matches!(dst_entry.typ, FileType::RegularFile)
-                        && dst_attr.nlink == 0
-                        && let Some(of) = open_files_ref.load(&dst_entry.inode).await
-                    {
-                        opened = of.is_opened().await;
-                    }
-                }
+                );
+                ctx.check_access(
+                    &new_parent_attr,
+                    kiseki_common::MODE_MASK_W | kiseki_common::MODE_MASK_X,
+                )?;
+                ensure!(
+                    old_entry.inode != new_parent && old_entry.inode != new_parent_attr.parent,
+                    LibcSnafu { errno: libc::EPERM }
+                );
+            }
 
-                // POSIX sticky bit check for rename operation
-                // When sticky bit is SET on destination directory, only file owner,
-                // directory owner, or root can delete/rename the destination file
-                if ctx.uid != 0
-                    && (new_parent_attr.mode & constants::S_ISVTX) != 0
-                    && ctx.uid != new_parent_attr.uid
-                    && ctx.uid != dst_attr.uid
+            let mut old_inode_attr = txn.get_for_update_or_missing(&key::Attr(old_entry.inode))?;
+            {
+                ensure!(old_inode_attr.is_normal(), LibcSnafu { errno: libc::EPERM });
+                // POSIX sticky bit check for rename source (POSIX.1-2008 Section 4.5.4)
+                // When sticky bit is SET on source directory, additional permission check
+                if old_parent != new_parent
+                    && old_parent_attr.mode & constants::S_ISVTX != 0
+                    && ctx.uid != 0
+                    && ctx.uid != old_inode_attr.uid
+                    && (ctx.uid != old_parent_attr.uid || old_inode_attr.is_dir())
                 {
                     return LibcSnafu {
                         errno: libc::EACCES,
@@ -1853,196 +1126,203 @@ impl Backend for RocksdbBackend {
                     .fail();
                 }
 
-                dst_dentry_opt = Some(dst_entry);
-                dst_attr_opt = Some(dst_attr);
-            }
-            Err(e) => {
-                if !e.is_not_found() {
-                    return Err(e);
-                }
-                ensure!(
-                    !matches!(flags, RenameFlags::EXCHANGE),
-                    LibcSnafu {
-                        errno: libc::ENOENT,
+                // POSIX sticky bit check for rename operation (POSIX.1-2008 Section 4.5.4)
+                // Additional sticky bit permission check for rename
+                if ctx.uid != 0
+                    && (old_parent_attr.mode & constants::S_ISVTX) != 0
+                    && ctx.uid != old_parent_attr.uid
+                    && ctx.uid != old_inode_attr.uid
+                {
+                    return LibcSnafu {
+                        errno: libc::EACCES,
                     }
-                );
-            }
-        }
-
-        if old_parent != new_parent {
-            old_inode_attr.parent = new_parent;
-            old_parent_attr.nlink -= 1;
-            new_parent_attr.nlink += 1;
-        }
-        let now = SystemTime::now();
-        let update_old_parent =
-            old_parent_attr.update_modification_time_if(now, self.skip_dir_mtime);
-        if update_new_parent {
-            new_parent_attr.update_modification_time_with(now);
-        } else {
-            update_new_parent =
-                new_parent_attr.update_modification_time_if(now, self.skip_dir_mtime);
-        }
-        old_inode_attr.ctime = now;
-
-        let mut write_batch = txn.get_writebatch();
-        match flags {
-            RenameFlags::EXCHANGE => {
-                // EXCHANGE requires the destination to exist; checked above.
-                let dst_dentry = dst_dentry_opt.context(LibcSnafu { errno: libc::EIO })?;
-                set_dentry_in_write_batch(
-                    &mut write_batch,
-                    old_parent,
-                    old_name,
-                    dst_dentry.inode,
-                    dst_dentry.typ,
-                )?;
-                let dst_attr = dst_attr_opt.context(LibcSnafu { errno: libc::EIO })?;
-                set_attr_in_write_batch(&mut write_batch, dst_dentry.inode, &dst_attr)?;
-                if old_parent != new_parent && dst_attr.parent.is_zero() {
-                    let cnt = do_get_hard_link_count(&txn, dst_dentry.inode, old_parent)?;
-                    set_hard_link_count_in_write_batch(
-                        &mut write_batch,
-                        dst_dentry.inode,
-                        old_parent,
-                        cnt + 1,
-                    )?;
-                    let cnt = {
-                        let mut cnt = do_get_hard_link_count(&txn, dst_dentry.inode, new_parent)?;
-                        cnt = cnt.saturating_sub(1);
-                        cnt
-                    };
-                    set_hard_link_count_in_write_batch(
-                        &mut write_batch,
-                        dst_dentry.inode,
-                        new_parent,
-                        cnt,
-                    )?;
+                    .fail();
                 }
             }
-            _ => {
-                write_batch.delete(key::dentry(old_parent, old_name));
-                rocksdb_delete!();
-                if let Some(dst_attr) = dst_attr_opt {
-                    // a destination attr always comes with its dentry; checked above.
-                    let dst_entry = dst_dentry_opt.context(LibcSnafu { errno: libc::EIO })?;
-                    if !matches!(dst_attr.kind, FileType::Directory) && dst_attr.nlink > 0 {
-                        set_attr_in_write_batch(&mut write_batch, dst_entry.inode, &dst_attr)?;
-                        if dst_attr.parent.is_zero() {
-                            let cnt = do_get_hard_link_count(&txn, dst_entry.inode, old_parent)?;
-                            if cnt > 0 {
-                                set_hard_link_count_in_write_batch(
-                                    &mut write_batch,
-                                    dst_entry.inode,
-                                    old_parent,
-                                    cnt - 1,
-                                )?;
+
+            let (mut update_new_parent, mut dst_dentry_opt, mut dst_attr_opt) = (false, None, None);
+            match txn.get(&key::Dentry(new_parent, new_name))? {
+                Some(dst_entry) => {
+                    // dst exists
+                    ensure!(
+                        !flags.contains(RenameFlags::NOREPLACE),
+                        LibcSnafu {
+                            errno: libc::EEXIST,
+                        }
+                    );
+
+                    let mut dst_attr =
+                        txn.get_for_update_or_missing(&key::Attr(dst_entry.inode))?;
+                    ensure!(dst_attr.is_normal(), LibcSnafu { errno: libc::EPERM });
+                    dst_attr.ctime = SystemTime::now();
+
+                    if matches!(flags, RenameFlags::EXCHANGE) {
+                        if old_parent != new_parent {
+                            if matches!(dst_entry.typ, FileType::Directory) {
+                                dst_attr.parent = old_parent;
+                                new_parent_attr.nlink -= 1;
+                                old_parent_attr.nlink += 1;
+                            } else if !dst_attr.parent.is_zero() {
+                                dst_attr.parent = old_parent;
                             }
                         }
+                    } else if matches!(dst_entry.typ, FileType::Directory) {
+                        ensure!(
+                            !do_check_exist_children(txn, dst_entry.inode)?,
+                            LibcSnafu {
+                                errno: libc::ENOTEMPTY,
+                            }
+                        );
+                        new_parent_attr.nlink -= 1;
+                        update_new_parent = true;
                     } else {
-                        if matches!(dst_attr.kind, FileType::RegularFile) {
-                            if opened {
-                                set_attr_in_write_batch(
-                                    &mut write_batch,
-                                    dst_entry.inode,
-                                    &dst_attr,
-                                )?;
-                                set_sustained_in_write_batch(
-                                    &mut write_batch,
-                                    session_id,
-                                    dst_entry.inode,
-                                    1,
-                                )?;
+                        dst_attr.nlink -= 1;
+                        // `opened` for the destination was sampled before the
+                        // transaction.
+                    }
+
+                    // POSIX sticky bit check for rename operation
+                    // When sticky bit is SET on destination directory, only file owner,
+                    // directory owner, or root can delete/rename the destination file
+                    if ctx.uid != 0
+                        && (new_parent_attr.mode & constants::S_ISVTX) != 0
+                        && ctx.uid != new_parent_attr.uid
+                        && ctx.uid != dst_attr.uid
+                    {
+                        return LibcSnafu {
+                            errno: libc::EACCES,
+                        }
+                        .fail();
+                    }
+
+                    dst_dentry_opt = Some(dst_entry);
+                    dst_attr_opt = Some(dst_attr);
+                }
+                None => {
+                    ensure!(
+                        !matches!(flags, RenameFlags::EXCHANGE),
+                        LibcSnafu {
+                            errno: libc::ENOENT,
+                        }
+                    );
+                }
+            }
+
+            if old_parent != new_parent {
+                old_inode_attr.parent = new_parent;
+                old_parent_attr.nlink -= 1;
+                new_parent_attr.nlink += 1;
+            }
+            let now = SystemTime::now();
+            let update_old_parent = old_parent_attr.update_modification_time_if(now, skip);
+            if update_new_parent {
+                new_parent_attr.update_modification_time_with(now);
+            } else {
+                update_new_parent = new_parent_attr.update_modification_time_if(now, skip);
+            }
+            old_inode_attr.ctime = now;
+
+            match flags {
+                RenameFlags::EXCHANGE => {
+                    // EXCHANGE requires the destination to exist; checked above.
+                    let dst_dentry = dst_dentry_opt.context(LibcSnafu { errno: libc::EIO })?;
+                    txn.put(
+                        &key::Dentry(old_parent, old_name),
+                        &DEntry {
+                            parent: old_parent,
+                            name:   old_name.to_string(),
+                            inode:  dst_dentry.inode,
+                            typ:    dst_dentry.typ,
+                        },
+                    )?;
+                    let dst_attr = dst_attr_opt.context(LibcSnafu { errno: libc::EIO })?;
+                    txn.put(&key::Attr(dst_dentry.inode), &dst_attr)?;
+                    if old_parent != new_parent && dst_attr.parent.is_zero() {
+                        let cnt = get_hard_link_count(txn, dst_dentry.inode, old_parent)?;
+                        txn.put(&key::HardLink(dst_dentry.inode, old_parent), &(cnt + 1))?;
+                        let cnt = get_hard_link_count(txn, dst_dentry.inode, new_parent)?
+                            .saturating_sub(1);
+                        txn.put(&key::HardLink(dst_dentry.inode, new_parent), &cnt)?;
+                    }
+                }
+                _ => {
+                    txn.delete(&key::Dentry(old_parent, old_name))?;
+                    if let Some(dst_attr) = dst_attr_opt {
+                        // a destination attr always comes with its dentry; checked above.
+                        let dst_entry = dst_dentry_opt.context(LibcSnafu { errno: libc::EIO })?;
+                        if !matches!(dst_attr.kind, FileType::Directory) && dst_attr.nlink > 0 {
+                            txn.put(&key::Attr(dst_entry.inode), &dst_attr)?;
+                            if dst_attr.parent.is_zero() {
+                                let cnt = get_hard_link_count(txn, dst_entry.inode, old_parent)?;
+                                if cnt > 0 {
+                                    txn.put(
+                                        &key::HardLink(dst_entry.inode, old_parent),
+                                        &(cnt - 1),
+                                    )?;
+                                }
+                            }
+                        } else {
+                            if matches!(dst_attr.kind, FileType::RegularFile) {
+                                if opened {
+                                    txn.put(&key::Attr(dst_entry.inode), &dst_attr)?;
+                                    txn.put(&key::Sustained(session_id, dst_entry.inode), &1u64)?;
+                                } else {
+                                    txn.put(&key::DeleteChunk(dst_entry.inode), &now_secs())?;
+                                    txn.delete(&key::Attr(dst_entry.inode))?;
+                                    rename_result.freed_space +=
+                                        kiseki_utils::align::align4k(dst_attr.length) as u64;
+                                    rename_result.freed_inode += 1;
+                                }
+                                rename_result.need_delete = Some((dst_entry.inode, opened));
                             } else {
-                                set_delete_chunk_after_in_write_batch(
-                                    &mut write_batch,
-                                    dst_entry.inode,
-                                )?;
-                                write_batch.delete(key::attr(dst_entry.inode));
-                                rocksdb_delete!();
-                                rename_result.freed_space +=
-                                    kiseki_utils::align::align4k(dst_attr.length) as u64;
+                                if matches!(dst_attr.kind, FileType::Symlink) {
+                                    txn.delete(&key::Symlink(dst_entry.inode))?;
+                                }
+                                txn.delete(&key::Attr(dst_entry.inode))?;
+                                rename_result.freed_space += 4096;
                                 rename_result.freed_inode += 1;
                             }
-                            rename_result.need_delete = Some((dst_entry.inode, opened));
-                        } else {
-                            if matches!(dst_attr.kind, FileType::Symlink) {
-                                write_batch.delete(key::symlink(dst_entry.inode));
-                                rocksdb_delete!();
-                            }
-                            write_batch.delete(key::attr(dst_entry.inode));
-                            rocksdb_delete!();
-                            rename_result.freed_space += 4096;
-                            rename_result.freed_inode += 1;
-                        }
 
-                        delete_prefix_in_txn_write_batch(
-                            &txn,
-                            &mut write_batch,
-                            &key::xattr_prefix(dst_entry.inode),
-                        );
-                        if dst_attr.parent.is_zero() {
-                            delete_prefix_in_txn_write_batch(
-                                &txn,
-                                &mut write_batch,
-                                &key::parent_prefix(dst_entry.inode),
-                            );
+                            txn.delete_prefix_raw(&crate::backend::key::xattr_prefix(
+                                dst_entry.inode,
+                            ))?;
+                            if dst_attr.parent.is_zero() {
+                                txn.delete_prefix(&key::HardLinkPrefix(dst_entry.inode))?;
+                            }
                         }
                     }
                 }
             }
-        }
 
-        if new_parent != old_parent {
-            if update_old_parent {
-                set_attr_in_write_batch(&mut write_batch, old_parent, &old_parent_attr)?;
+            if new_parent != old_parent {
+                if update_old_parent {
+                    txn.put(&key::Attr(old_parent), &old_parent_attr)?;
+                }
+                if old_inode_attr.parent.is_zero() {
+                    let cnt = get_hard_link_count(txn, old_entry.inode, new_parent)?;
+                    txn.put(&key::HardLink(old_entry.inode, new_parent), &(cnt + 1))?;
+                    let cnt =
+                        get_hard_link_count(txn, old_entry.inode, old_parent)?.saturating_sub(1);
+                    txn.put(&key::HardLink(old_entry.inode, old_parent), &cnt)?;
+                }
             }
-            if old_inode_attr.parent.is_zero() {
-                let cnt = do_get_hard_link_count(&txn, old_entry.inode, new_parent)?;
-                set_hard_link_count_in_write_batch(
-                    &mut write_batch,
-                    old_entry.inode,
-                    new_parent,
-                    cnt + 1,
-                )?;
-                let mut cnt = do_get_hard_link_count(&txn, old_entry.inode, old_parent)?;
-                cnt = cnt.saturating_sub(1);
-                set_hard_link_count_in_write_batch(
-                    &mut write_batch,
-                    old_entry.inode,
-                    old_parent,
-                    cnt,
-                )?;
+
+            txn.put(&key::Attr(old_entry.inode), &old_inode_attr)?;
+            txn.put(
+                &key::Dentry(new_parent, new_name),
+                &DEntry {
+                    parent: new_parent,
+                    name:   new_name.to_string(),
+                    inode:  old_entry.inode,
+                    typ:    old_inode_attr.kind,
+                },
+            )?;
+            if update_new_parent {
+                txn.put(&key::Attr(new_parent), &new_parent_attr)?;
             }
-        }
 
-        set_attr_in_write_batch(&mut write_batch, old_entry.inode, &old_inode_attr)?;
-        set_dentry_in_write_batch(
-            &mut write_batch,
-            new_parent,
-            new_name,
-            old_entry.inode,
-            old_inode_attr.kind,
-        )?;
-        if update_new_parent {
-            set_attr_in_write_batch(&mut write_batch, new_parent, &new_parent_attr)?;
-        }
-
-        // Record RocksDB operations with metrics
-        rocksdb_timed_op!(
-            db_batch_writes_total,
-            db_write_duration_ms,
-            self.db.write(write_batch)
-        )
-        .context(RocksdbSnafu)?;
-        rocksdb_timed_op!(
-            db_transactions_total,
-            db_transaction_duration_ms,
-            txn.commit()
-        )
-        .context(RocksdbSnafu)?;
-
-        Ok(rename_result)
+            Ok(rename_result)
+        })
     }
 
     /// Read symbolic link target path - POSIX readlink(2) wrapper
@@ -2057,12 +1337,11 @@ impl Backend for RocksdbBackend {
     ///   data
     ///
     /// Implementation Details:
-    /// - Simple wrapper around do_get_symlink helper function
-    /// - Maintains separation between public API and internal implementation
-    /// - Inherits all POSIX compliance guarantees from do_get_symlink
+    /// - Reads the raw symlink bytes back verbatim (they are stored without a
+    ///   bincode wrapper) and returns them unchanged.
     fn do_readlink(&self, inode: Ino) -> Result<Bytes> {
-        let symlink = do_get_symlink(&self.db, inode)?;
-        Ok(symlink)
+        let target = self.kv.get_or_missing(&key::Symlink(inode))?;
+        Ok(target.0)
     }
 }
 
@@ -2079,14 +1358,9 @@ mod tests {
     #[fixture]
     fn test_backend() -> (RocksdbBackend, TempDir) {
         let tempdir = tempfile::tempdir().unwrap();
-        let mut opts = rocksdb::Options::default();
-        opts.create_if_missing(true);
-        opts.create_missing_column_families(true);
-        opts.increase_parallelism(kiseki_utils::num_cpus() as i32);
-
-        let db = rocksdb::OptimisticTransactionDB::open(&opts, tempdir.path()).unwrap();
+        let kv = RocksDbKv::open(tempdir.path()).unwrap();
         let backend = RocksdbBackend {
-            db,
+            kv,
             skip_dir_mtime: Duration::from_millis(100),
         };
         (backend, tempdir)
@@ -2144,9 +1418,13 @@ mod tests {
         let (backend, _tempdir) = test_backend;
         let root = InodeAttr::hard_code_inode_attr(false);
 
-        let transaction = backend.db.transaction();
-        stage_initial_state(&transaction, &sample_format, &root).unwrap();
-        drop(transaction);
+        // Stage the initial state, then abort the transaction with an
+        // application error so nothing is committed.
+        let result: Result<()> = backend.kv.transaction(|txn| {
+            stage_initial_state(txn, &sample_format, &root)?;
+            LibcSnafu { errno: libc::EIO }.fail()
+        });
+        assert!(result.is_err());
 
         assert!(backend.load_format().is_err());
         assert!(backend.get_attr(ROOT_INO).is_err());
@@ -2301,7 +1579,7 @@ mod tests {
         assert_eq!(loaded_stat.length, 2048);
     }
 
-    // Test helper functions with our new macros
+    // Test typed reads directly against the KV layer
     #[rstest]
     fn test_helper_functions(test_backend: (RocksdbBackend, TempDir), sample_attr: InodeAttr) {
         let (backend, _tempdir) = test_backend;
@@ -2310,18 +1588,21 @@ mod tests {
         // Set up test data using backend methods
         backend.set_attr(inode, &sample_attr).unwrap();
 
-        // Test do_get_attr helper function
-        let attr = do_get_attr(&backend.db, inode).unwrap();
+        // Typed attr read
+        let attr = backend.kv.get_or_missing(&key::Attr(inode)).unwrap();
         assert_eq!(attr.uid, sample_attr.uid);
 
-        // Test do_get_dentry helper function
+        // Typed dentry read
         let parent = Ino(1);
         let name = "test_helper";
         backend
             .set_dentry(parent, name, inode, FileType::RegularFile)
             .unwrap();
 
-        let dentry = do_get_dentry(&backend.db, parent, name).unwrap();
+        let dentry = backend
+            .kv
+            .get_or_missing(&key::Dentry(parent, name))
+            .unwrap();
         assert_eq!(dentry.inode, inode);
         assert_eq!(dentry.name, name);
     }
@@ -2429,9 +1710,12 @@ mod tests {
             )
             .unwrap();
         let slice = Slice::new_owned(0, 200, 8);
-        let transaction = backend.db.transaction();
-        stage_slice_commit(&transaction, inode, 0, &slice).unwrap();
-        drop(transaction);
+        // Stage a slice commit, then abort so nothing is published.
+        let result: Result<()> = backend.kv.transaction(|txn| {
+            stage_slice_commit(txn, inode, 0, &slice)?;
+            LibcSnafu { errno: libc::EIO }.fail()
+        });
+        assert!(result.is_err());
 
         assert_eq!(backend.get_attr(inode).unwrap().length, 0);
         assert!(backend.get_raw_chunk_slices(inode, 0).unwrap().is_none());
