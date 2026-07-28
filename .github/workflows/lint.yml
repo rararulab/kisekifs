@@ -37,7 +37,7 @@ jobs:
       rust-version: ${{ steps.rust-version.outputs.version }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Get Rust version from toolchain
         id: rust-version
