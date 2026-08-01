@@ -156,7 +156,7 @@ jobs:
           sudo apt-get install -y libfuse3-dev
 
       - name: Install cargo-tarpaulin
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@v2.85.4
         with:
           tool: cargo-tarpaulin
 
@@ -203,7 +203,7 @@ jobs:
           toolchain: ${{ needs.rust-version.outputs.version }}
 
       - name: Install cargo-deny
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@v2.85.4
         with:
           tool: cargo-deny@0.20.2
 
